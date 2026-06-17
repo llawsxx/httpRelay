@@ -125,6 +125,7 @@ static void* memmem_compat(const void* h, size_t hl, const void* n, size_t nl) {
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <fcntl.h>
 
 typedef int sock_t;
 #define BADSOCK (-1)
