@@ -17,15 +17,15 @@
  * Both host A and host B run the SAME program, both listening on the same port (default 8080).
  *
  * A client connects to A using:
- *   http://A:8080/client/<peerHost:peerPort>-<targetHost:targetPort>/original/path
+ *   http://A:8080/relay/<peerHost:peerPort>/<targetHost:targetPort>/original/path
  * e.g.
- *   http://127.0.0.1:8080/client/188.241.219.163:8080-127.0.0.1:9090/download/wechat.exe
+ *   http://127.0.0.1:8080/relay/188.241.219.163:8080/127.0.0.1:9090/download/wechat.exe
  *
  * Flow:
  *   client --HTTP--> A relay --[reliable session protocol over TCP, reconnectable]--> B relay --HTTP--> target
  *
  * IPv6 addresses in the URL must be bracketed:
- *   /client/[2001:db8::1]:8080-[fe80::2]:9090/path
+ *   /relay/[2001:db8::1]:8080/[fe80::2]:9090/path
  *
  * Behaviour:
  *   - The A<->B TCP link may drop. As long as the client (A side) and the target (B side)
@@ -370,6 +370,9 @@ typedef struct {
     volatile int send_dirty;  /* 标记: 有待发送数据 (避免丢失唤醒) */
     thread_t  send_thr;       /* 发送线程句柄 */
     volatile int send_running;
+
+    mutex_t   ref_lk;       /* 保护 refcnt（也可用原子操作替代）*/
+    int       refcnt;       /* 引用计数 */
 }sess_t;
 
 static void* sender_thread(void* arg);
@@ -382,6 +385,8 @@ static void session_init(sess_t* s) {
     mutex_init(&s->term_lk);
     cond_init(&s->send_cv);
     s->send_dirty = 0;
+    s->refcnt = 1;                 /* owner持有的引用 */
+    mutex_init(&s->ref_lk);
 }
 static void session_start_sender(sess_t* s) {
     s->send_running = 1;
@@ -435,6 +440,28 @@ static void session_terminate(sess_t* s) {
     mutex_unlock(&s->send_lk);
 }
 
+/* 增加引用（调用者已确保 s 当前有效，通常在表锁内调用）*/
+static void session_addref(sess_t* s) {
+    mutex_lock(&s->ref_lk);
+    s->refcnt++;
+    mutex_unlock(&s->ref_lk);
+}
+
+/* 释放引用，降到 0 时真正销毁 */
+static void session_release(sess_t* s) {
+    mutex_lock(&s->ref_lk);
+    int n = --s->refcnt;
+    mutex_unlock(&s->ref_lk);
+    if (n == 0) {
+        /* 此刻没有任何人持有 s，安全销毁 */
+        if (s->app_fd != BADSOCK) closesock(s->app_fd);
+        if (s->peer_fd != BADSOCK) closesock(s->peer_fd);
+        session_uninit(s);          /* 销毁 recv_lk/peer_lk/send_lk/send_cv/out 等 */
+        mutex_destroy(&s->ref_lk);
+        LOG("session_release ok sid=%llu", s->sid);
+        free(s);
+    }
+}
 
 /* 生产者调用：标记有新数据并唤醒发送线程 (不阻塞) */
 static void notify_send(sess_t* s) {
@@ -574,7 +601,7 @@ static void parse_hp(const char* s, char* host, char* port) {
 /* ============================================================
  *  Request parsing / rewriting
  *
- *  Parse the request line "<METHOD> /client/<peer>-<target>/path <VER>",
+ *  Parse the request line "<METHOD> /relay/<peer>/<target>/path <VER>",
  *  extract peer/target, and build the rewritten request header block
  *  (rewritten request line + headers with Host replaced by target).
  * ============================================================ */
@@ -585,17 +612,37 @@ static int rewrite_request(const char* hdr, size_t he,
     char* eol = strstr(h, "\r\n"); if (!eol) { free(h); return -1; } *eol = 0;
     char m[16], uri[4096], v[16];
     if (sscanf(h, "%15s %4095s %15s", m, uri, v) != 3) { free(h); return -1; }
-    if (strncmp(uri, "/client/", 8)) { free(h); return -1; }
-    char* rest = uri + 8, * slash = strchr(rest, '/'); char ad[1024], rp[4096];
-    if (slash) {
-        size_t al = (size_t)(slash - rest); if (al >= sizeof ad)al = sizeof ad - 1;
-        memcpy(ad, rest, al); ad[al] = 0; snprintf(rp, sizeof rp, "%s", slash);
+    if (strncmp(uri, "/relay/", 7)) { free(h); return -1; }
+    /* URL 形如: /relay/<peer>/<target>/<path...>
+       <peer> 和 <target> 形如 host:port 或 [ipv6]:port (本身不含 '/') */
+    char* rest = uri + 7;            /* "<peer>/<target>/path..." */
+    char peer_s[1024], targ_s[1024], rp[4096];
+
+    /* 第 1 段: peer，到第一个 '/' 为止 */
+    char* sl1 = strchr(rest, '/');
+    if (!sl1) { free(h); return -1; }                 /* 缺少 target 段 */
+    size_t pl = (size_t)(sl1 - rest);
+    if (pl == 0 || pl >= sizeof peer_s) { free(h); return -1; }
+    memcpy(peer_s, rest, pl); peer_s[pl] = 0;
+
+    /* 第 2 段: target，从 sl1+1 到下一个 '/'(或字符串结尾) */
+    char* tstart = sl1 + 1;
+    char* sl2 = strchr(tstart, '/');
+    if (sl2) {
+        size_t tl = (size_t)(sl2 - tstart);
+        if (tl == 0 || tl >= sizeof targ_s) { free(h); return -1; }
+        memcpy(targ_s, tstart, tl); targ_s[tl] = 0;
+        snprintf(rp, sizeof rp, "%s", sl2);           /* 剩余转发路径, 以 '/' 开头 */
     }
-    else { snprintf(ad, sizeof ad, "%s", rest); strcpy(rp, "/"); }
-    char* q = ad; if (*q == '[') { q = strchr(q, ']'); if (!q) { free(h); return -1; } }
-    char* cl = strchr(q, ':'); if (!cl) { free(h); return -1; }
-    char* dash = strchr(cl, '-'); if (!dash) { free(h); return -1; }
-    *dash = 0; parse_hp(ad, ph, pp); parse_hp(dash + 1, th, tp);
+    else {
+        size_t tl = strlen(tstart);
+        if (tl == 0 || tl >= sizeof targ_s) { free(h); return -1; }
+        memcpy(targ_s, tstart, tl); targ_s[tl] = 0;
+        strcpy(rp, "/");                              /* 没有额外路径, 默认 "/" */
+    }
+
+    parse_hp(peer_s, ph, pp);
+    parse_hp(targ_s, th, tp);
 
     size_t cap = he + 512; char* ob = (char*)malloc(cap); if (!ob) { free(h); return -1; } size_t ol = 0;
     ol += (size_t)snprintf(ob + ol, cap - ol, "%s %s %s\r\n", m, rp, v);
@@ -701,17 +748,35 @@ static sess_t* g_tbl[MAXS]; static int g_tbln = 0;
 static mutex_t g_tbl_lk;
 static void b_register(sess_t* s) {
     mutex_lock(&g_tbl_lk);
-    if (g_tbln < MAXS)g_tbl[g_tbln++] = s; mutex_unlock(&g_tbl_lk);
-}
-static void b_unregister(sess_t* s) {
-    mutex_lock(&g_tbl_lk);
-    for (int i = 0; i < g_tbln; i++)if (g_tbl[i] == s) { g_tbl[i] = g_tbl[--g_tbln]; break; }
+    if (g_tbln < MAXS) { g_tbl[g_tbln++] = s; session_addref(s); }  /* 表持有 +1 */
+    else {
+        LOG("ERROR: session table full (MAXS=%d), cannot register sid=%llu", MAXS, (unsigned long long)s->sid);
+    }
     mutex_unlock(&g_tbl_lk);
 }
+
+static void b_unregister(sess_t* s) {
+    int found = 0;
+    mutex_lock(&g_tbl_lk);
+    for (int i = 0; i < g_tbln; i++) {
+        if (g_tbl[i] == s) { g_tbl[i] = g_tbl[--g_tbln]; found = 1; break; }
+    }
+    mutex_unlock(&g_tbl_lk);
+    if (found) session_release(s);    /* 释放"表持有"的那个引用 */
+}
+
 static sess_t* b_find(uint64_t sid) {
-    sess_t* r = NULL; mutex_lock(&g_tbl_lk);
-    for (int i = 0; i < g_tbln; i++)if (g_tbl[i] && g_tbl[i]->sid == sid) { r = g_tbl[i]; break; }
-    mutex_unlock(&g_tbl_lk); return r;
+    sess_t* r = NULL;
+    mutex_lock(&g_tbl_lk);
+    for (int i = 0; i < g_tbln; i++) {
+        if (g_tbl[i]->sid == sid) {
+            r = g_tbl[i];
+            session_addref(r);          /* 表锁内 addref：保证返回后 s 不会被 free */
+            break;
+        }
+    }
+    mutex_unlock(&g_tbl_lk);
+    return r;                    /* 调用方用完必须 session_release */
 }
 
 /* ============================================================
@@ -1015,14 +1080,8 @@ static void* handle_client(void* arg) {
     session_terminate(s);
     thread_join(prt);
     session_stop_sender(s);
-    /* 现在没有任何线程会再碰 fd 了, 安全 close */
-    if (s->app_fd != BADSOCK) { closesock(s->app_fd); s->app_fd = BADSOCK; }
-    mutex_lock(&s->peer_lk);
-    if (s->peer_fd != BADSOCK) { closesock(s->peer_fd); s->peer_fd = BADSOCK; }
-    mutex_unlock(&s->peer_lk);
+    session_release(s);
     hin_free(&in);
-    session_uninit(s);
-    free(s);
     return 0;
 }
 
@@ -1083,14 +1142,8 @@ static void* handle_peer(void* arg) {
         session_terminate(s);
         thread_join(th2);
         session_stop_sender(s);
-        /* 现在没有任何线程会再碰 fd 了, 安全 close */
-        if (s->app_fd != BADSOCK) { closesock(s->app_fd); s->app_fd = BADSOCK; }
-        mutex_lock(&s->peer_lk);
-        if (s->peer_fd != BADSOCK) { closesock(s->peer_fd); s->peer_fd = BADSOCK; }
-        mutex_unlock(&s->peer_lk);
         b_unregister(s);
-        session_uninit(s);
-        free(s);
+        session_release(s);
         return 0;
     }
     else if (h.type == MSG_RESUME) {
@@ -1104,8 +1157,11 @@ static void* handle_peer(void* arg) {
         }
         mutex_lock(&s->recv_lk); uint64_t myrecv = s->recv_off; mutex_unlock(&s->recv_lk);
         uint64_t be = sw64(myrecv);
-        if (send_frame(pfd, MSG_RESUME_ACK, sid, &be, 8) < 0) { closesock(pfd); return 0; }
-
+        if (send_frame(pfd, MSG_RESUME_ACK, sid, &be, 8) < 0) {
+            session_release(s);
+            closesock(pfd);
+            return 0;
+        }
         sw_drop_to(&s->out, peer_recv);
         mutex_lock(&s->peer_lk);              /* 原子: 重置 sent + 换 peer_fd */
         mutex_lock(&s->out.lk);
@@ -1117,6 +1173,7 @@ static void* handle_peer(void* arg) {
         s->down_since = 0;
         notify_send(s);
         LOG("B side session sid=%llu buffer accumulation len=%llu", (unsigned long long)sid, (unsigned long long)s->out.len);
+        session_release(s);
         return 0;
     }
     free(pl); closesock(pfd); return 0;
@@ -1169,16 +1226,16 @@ static void print_help(const char* prog) {
         "     Host_B$ %s -p 8080\n"
         "\n"
         "  3. Client connects to A:\n"
-        "     http://HOST_A:8080/client/HOST_B:8080-TARGET_HOST:TARGET_PORT/path\n"
+        "     http://HOST_A:8080/relay/HOST_B:8080/TARGET_HOST:TARGET_PORT/path\n"
         "\n"
         "  Example (IPv4):\n"
-        "     http://192.168.1.1:8080/client/192.168.1.2:8080-10.0.0.5:9090/download/file.zip\n"
+        "     http://192.168.1.1:8080/relay/192.168.1.2:8080/10.0.0.5:9090/download/file.zip\n"
         "\n"
         "  Example (IPv6):\n"
-        "     http://[::1]:8080/client/[2001:db8::1]:8080-[fe80::2]:9090/path\n"
+        "     http://[::1]:8080/relay/[2001:db8::1]:8080/[fe80::2]:9090/path\n"
         "\n"
         "URL FORMAT:\n"
-        "  /client/<PEER_HOST:PEER_PORT>-<TARGET_HOST:TARGET_PORT>/<ORIGINAL_PATH>\n"
+        "  /relay/<PEER_HOST:PEER_PORT>/<TARGET_HOST:TARGET_PORT>/<ORIGINAL_PATH>\n"
         "\n"
         "  PEER_HOST:PEER_PORT       Address of the other relay (B side)\n"
         "  TARGET_HOST:TARGET_PORT   Address of the actual target server\n"
