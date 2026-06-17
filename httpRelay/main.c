@@ -175,7 +175,12 @@ static int    g_port = 8080;
 static size_t g_max_buffer = 64 * 1024 * 1024;  /* max in-flight buffer per direction */
 static int    g_reconnect_timeout = 60;            /* seconds before giving up reconnection */
 static int    g_reconnect_ms = 500;           /* delay between reconnect attempts */
+static int    g_client_connect_timeout = 10;    /* 客户端连接目标超时 (秒) */
+static int    g_client_io_timeout = 120;         /* 客户端 I/O 超时 (秒) */
+static int    g_peer_connect_timeout = 10;      /* Peer 间连接超时 (秒) */
+static int    g_peer_io_timeout = 20;           /* Peer 间 I/O 超时 (秒) */
 #define IO_CHUNK 32768
+#define APP_POLL_INTERVAL_SEC 2
 
 static int64_t now_ms(void) {
 #ifdef _WIN32
@@ -207,22 +212,55 @@ static uint64_t sw64(uint64_t v) {
 }
 static uint32_t sw32(uint32_t v) { return((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | ((v >> 24) & 0xff); }
 
+/* 判断当前 sockerrno 是否为 "超时/可重试" (用于 SO_RCVTIMEO/SO_SNDTIMEO) */
+static int sock_is_timeout(void) {
+#ifdef _WIN32
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT;
+#endif
+}
+static int sock_is_eintr(void) {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEINTR;
+#else
+    return errno == EINTR;
+#endif
+}
+
+
 static int wfull(sock_t fd, const void* b, size_t n) {
-    const char* p = (const char*)b; size_t s = 0;
+    const char* p = (const char*)b;
+    size_t s = 0;
     while (s < n) {
         int w = send(fd, p + s, (int)(n - s), MSG_NOSIGNAL);
-        if (w < 0) { if (sockerrno == SOCK_EINTR)continue; return -1; } s += (size_t)w;
+        if (w < 0) {
+            if (sock_is_eintr()) continue;   /* 仅 EINTR 重试 */
+            return -1;                        /* 超时/真错误都算失败, 触发重连 */
+        }
+        s += (size_t)w;
     }
     return 0;
 }
+
 static int rfull(sock_t fd, void* b, size_t n) {
-    char* p = (char*)b; size_t g = 0;
+    char* p = (char*)b;
+    size_t g = 0;
     while (g < n) {
         int r = recv(fd, p + g, (int)(n - g), 0);
-        if (r == 0) return 0; if (r < 0) { if (sockerrno == SOCK_EINTR) continue; return -1; } g += (size_t)r;
+        if (r == 0) return 0;
+        if (r < 0) {
+            if (sock_is_eintr()) continue;
+            return -1;
+        }
+        g += (size_t)r;
     }
     return 1;
 }
+
+
+
 static void nodelay_on(sock_t fd) { int o = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&o, sizeof o); }
 
 static int send_frame(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t pn) {
@@ -383,6 +421,11 @@ typedef struct {
     size_t resp_header_cap;
     size_t resp_header_len;
     volatile int resp_header_complete;  /* 0=未完成, 1=已完成, -1=不需要重写 */
+
+    /* ---- 统一活动超时 (client 侧 app_fd) ---- */
+    mutex_t   act_lk;            /* 保护 last_activity */
+    int64_t   last_activity;     /* 最近一次 app_fd 上成功 I/O 的时间(ms) */
+    int       app_io_timeout;    /* 该会话 app 侧总超时(秒)，0=不启用 */
 }sess_t;
 
 static void* sender_thread(void* arg);
@@ -393,6 +436,7 @@ static void session_init(sess_t* s) {
     mutex_init(&s->recv_lk);
     mutex_init(&s->send_lk);
     mutex_init(&s->term_lk);
+    mutex_init(&s->act_lk); 
     cond_init(&s->send_cv);
     s->send_dirty = 0;
     s->refcnt = 1;                 /* owner持有的引用 */
@@ -405,7 +449,13 @@ static void session_init(sess_t* s) {
     s->resp_header_cap = 0;
     s->resp_header_len = 0;
     s->resp_header_complete = 0;
+    s->last_activity = now_ms();
+    s->app_io_timeout = 0;
 }
+
+
+
+
 static void session_start_sender(sess_t* s) {
     s->send_running = 1;
     thread_create(&s->send_thr, sender_thread, s);
@@ -423,6 +473,7 @@ static void session_uninit(sess_t* s) {
     mutex_destroy(&s->recv_lk);
     mutex_destroy(&s->send_lk);
     mutex_destroy(&s->term_lk);
+    mutex_destroy(&s->act_lk);
     cond_destroy(&s->send_cv);
     if (s->open_pl) {
         free(s->open_pl);
@@ -433,6 +484,24 @@ static void session_uninit(sess_t* s) {
         free(s->resp_header_buf);
         s->resp_header_buf = NULL;
     }
+}
+
+/* 更新 app 侧最后活动时间 (recv/send 成功时调用) */
+static void sess_touch_activity(sess_t* s) {
+    if (!s) return;
+    mutex_lock(&s->act_lk);
+    s->last_activity = now_ms();
+    mutex_unlock(&s->act_lk);
+}
+
+/* 检查 app 侧是否已超时。返回 1=超时, 0=未超时。
+ * app_io_timeout<=0 时永不超时(返回0)。 */
+static int sess_app_timed_out(sess_t* s) {
+    if (!s || s->app_io_timeout <= 0) return 0;
+    mutex_lock(&s->act_lk);
+    int64_t la = s->last_activity;
+    mutex_unlock(&s->act_lk);
+    return (now_ms() - la) >= (int64_t)s->app_io_timeout * 1000;
 }
 
 /* Terminate a session: set closing and unblock threads that may be blocked in recv(). */
@@ -483,6 +552,37 @@ static void session_release(sess_t* s) {
         LOG("session_release ok sid=%llu", s->sid);
         free(s);
     }
+}
+
+
+/* 向 app_fd 写满 n 字节，带 "活动超时" 语义。
+ * 成功(0): 任何成功的 send 都会刷新活动时间。
+ * 超时返回 send 阻塞但 last_activity(可能被对向 recv 刷新)未到总超时, 则继续。
+ * 返回 0 成功, -1 失败/真超时/会话关闭。 */
+static int wfull_app(sess_t* s, const void* b, size_t n) {
+    const char* p = (const char*)b;
+    size_t snt = 0;
+    while (snt < n) {
+        if (s->closing) return -1;
+        int w = send(s->app_fd, p + snt, (int)(n - snt), MSG_NOSIGNAL);
+        if (w > 0) {
+            snt += (size_t)w;
+            sess_touch_activity(s);   /* send 成功 -> 刷新活动 */
+            continue;
+        }
+        if (w == 0) return -1;
+        if (sock_is_eintr()) continue;
+        if (sock_is_timeout()) {
+            /* 本次 send 超时窗口内没成功; 但只要整体活动未超时就继续 */
+            if (sess_app_timed_out(s)) {
+                LOG("app send activity timeout sid=%llu", (unsigned long long)s->sid);
+                return -1;
+            }
+            continue;   /* 续命, 重试 */
+        }
+        return -1;      /* 真错误 */
+    }
+    return 0;
 }
 
 /* 生产者调用：标记有新数据并唤醒发送线程 (不阻塞) */
@@ -552,35 +652,163 @@ static void* sender_thread(void* arg) {
     return NULL;
 }
 
+/* ============================================================
+ *  Socket timeout helpers
+ * ============================================================ */
 
+ /* 设置 socket 接收超时 */
+static void set_recv_timeout(sock_t fd, int seconds) {
+    if (fd == BADSOCK) return;
+#ifdef _WIN32
+    DWORD timeout = (DWORD)(seconds * 1000);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const void*)&tv, sizeof(tv));
+#endif
+}
 
+/* 设置 socket 发送超时 */
+static void set_send_timeout(sock_t fd, int seconds) {
+    if (fd == BADSOCK) return;
+#ifdef _WIN32
+    DWORD timeout = (DWORD)(seconds * 1000);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const void*)&tv, sizeof(tv));
+#endif
+}
+
+/* 设置连接超时（非阻塞 connect + select） */
+static sock_t connect_with_timeout(const char* h, const char* p, int timeout_sec) {
+    if (timeout_sec <= 0) timeout_sec = 30;  /* 默认 30 秒 */
+
+    struct addrinfo hi, * r = NULL, * rp;
+    memset(&hi, 0, sizeof hi);
+    hi.ai_family = AF_UNSPEC;
+    hi.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(h, p, &hi, &r) != 0) return BADSOCK;
+
+    sock_t fd = BADSOCK;
+    for (rp = r; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd == BADSOCK) continue;
+
+#ifdef _WIN32
+        u_long mode = 1;
+        ioctlsocket(fd, FIONBIO, &mode);
+#else
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+        int rc = connect(fd, rp->ai_addr, (int)rp->ai_addrlen);
+        if (rc == 0) {
+#ifdef _WIN32
+            mode = 0;
+            ioctlsocket(fd, FIONBIO, &mode);
+#else
+            fcntl(fd, F_SETFL, flags);
+#endif
+            break;
+        }
+
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+        if (errno == EINPROGRESS) {
+#endif
+            fd_set writefds, exceptfds;
+            struct timeval tv;
+            tv.tv_sec = timeout_sec;
+            tv.tv_usec = 0;
+
+            FD_ZERO(&writefds);
+            FD_ZERO(&exceptfds);
+            FD_SET(fd, &writefds);
+            FD_SET(fd, &exceptfds);
+            /*
+             * Windows: select() 的第一个参数在 Windows 上被忽略，
+             * 但为了代码兼容性，传递 (int)fd + 1
+             */
+            rc = select((int)fd + 1, NULL, &writefds, &exceptfds, &tv);
+            if (rc > 0 && FD_ISSET(fd, &writefds)) {
+                int error = 0;
+                socklen_t len = sizeof(error);
+#ifdef _WIN32
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
+#else
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len);
+#endif
+                if (error == 0) {
+#ifdef _WIN32
+                    mode = 0;
+                    ioctlsocket(fd, FIONBIO, &mode);
+#else
+                    fcntl(fd, F_SETFL, flags);
+#endif
+                    break;
+                }
+            }
+        }
+
+        closesock(fd);
+        fd = BADSOCK;
+    }
+
+    freeaddrinfo(r);
+    return fd;
+}
 
 /* ============================================================
  *  Address resolution / connect / listen
  * ============================================================ */
-static sock_t connect_host(const char* h, const char* p) {
-    struct addrinfo hi, * r = NULL, * rp; memset(&hi, 0, sizeof hi);
-    hi.ai_family = AF_UNSPEC; hi.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(h, p, &hi, &r) != 0)return BADSOCK;
-    sock_t fd = BADSOCK;
-    for (rp = r; rp; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == BADSOCK)continue;
-        if (connect(fd, rp->ai_addr, (int)rp->ai_addrlen) == 0)break;
-        closesock(fd); fd = BADSOCK;
+ /* Client 端连接目标服务器 (B 侧连接最终目标) */
+
+/* Peer 间连接 (A 连接 B) */
+static sock_t connect_peer(const char* h, const char* p) {
+    sock_t fd = connect_with_timeout(h, p, g_peer_connect_timeout);
+    if (fd != BADSOCK) {
+        nodelay_on(fd);
+        set_recv_timeout(fd, g_peer_io_timeout);
+        set_send_timeout(fd, g_peer_io_timeout);
     }
-    freeaddrinfo(r);
-    if (fd != BADSOCK)nodelay_on(fd);
     return fd;
 }
+
+
+/* 为客户端 socket 设置超时 (A 侧接收客户端连接) */
+static void setup_client_socket(sock_t fd) {
+    if (fd == BADSOCK) return;
+    nodelay_on(fd);
+    /* 用短轮询间隔, 真正的超时判断交给 last_activity 逻辑 */
+    set_recv_timeout(fd, APP_POLL_INTERVAL_SEC);
+    set_send_timeout(fd, APP_POLL_INTERVAL_SEC);
+}
+
+/* 为 peer socket 设置超时 (B 侧接收 peer 连接) */
+static void setup_peer_socket(sock_t fd) {
+    if (fd == BADSOCK) return;
+    nodelay_on(fd);
+    set_recv_timeout(fd, g_peer_io_timeout);
+    set_send_timeout(fd, g_peer_io_timeout);
+}
+
 static sock_t listen_on(int port) {
     char portstr[16]; snprintf(portstr, sizeof portstr, "%d", port);
     sock_t fd = socket(AF_INET6, SOCK_STREAM, 0);
     int o = 1;
     if (fd != BADSOCK) {
         int v6 = 0;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6, sizeof v6); /* dual stack */
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&v6, sizeof v6);
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&o, sizeof o);
+
         struct sockaddr_in6 a; memset(&a, 0, sizeof a);
         a.sin6_family = AF_INET6; a.sin6_addr = in6addr_any; a.sin6_port = htons((unsigned short)port);
         if (bind(fd, (struct sockaddr*)&a, sizeof a) == 0 && listen(fd, 128) == 0) return fd;
@@ -591,7 +819,10 @@ static sock_t listen_on(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&o, sizeof o);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons((unsigned short)port);
-    if (bind(fd, (struct sockaddr*)&a, sizeof a) < 0 || listen(fd, 128) < 0) { closesock(fd); return BADSOCK; }
+    if (bind(fd, (struct sockaddr*)&a, sizeof a) < 0 || listen(fd, 128) < 0) {
+        closesock(fd);
+        return BADSOCK;
+    }
     return fd;
 }
 
@@ -961,33 +1192,46 @@ static int rewrite_location(
 
 
 /* Used by B side (target->B->A) and as a generic app->peer pump. */
-static void* t_app2peer(void* a) {
-    sess_t* s = (sess_t*)a; char* c = (char*)malloc(IO_CHUNK);
-    for (;;) {
-        int r = recv(s->app_fd, c, IO_CHUNK, 0);
-        if (r <= 0) { break; }
-        uint64_t off;
-        int rc = sw_append(&s->out, c, (size_t)r, g_max_buffer, &off,
-            (volatile int*)&s->closing);
-        if (rc < 0) {
-            break;
-        }
-        notify_send(s);
-    }
-    free(c);
-    mutex_lock(&s->peer_lk);
-    if (s->peer_fd != BADSOCK) send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
-    mutex_unlock(&s->peer_lk);
-    session_terminate(s);
-    return NULL;
-}
+ static void* t_app2peer(void* a) {
+     sess_t* s = (sess_t*)a; char* c = (char*)malloc(IO_CHUNK);
+     for (;;) {
+         if (s->closing) break;
+         int r = recv(s->app_fd, c, IO_CHUNK, 0);
+         if (r > 0) {
+             sess_touch_activity(s);             /* recv 成功 -> 刷新活动 */
+             uint64_t off;
+             int rc = sw_append(&s->out, c, (size_t)r, g_max_buffer, &off,
+                 (volatile int*)&s->closing);
+             if (rc < 0) break;
+             notify_send(s);
+             continue;
+         }
+         if (r == 0) break;                      /* 对端正常关闭 */
+         /* r < 0 */
+         if (sock_is_eintr()) continue;
+         if (sock_is_timeout()) {
+             if (sess_app_timed_out(s)) {
+                 LOG("app recv activity timeout sid=%llu", (unsigned long long)s->sid);
+                 break;
+             }
+             continue;                            /* 续命 */
+         }
+         break;                                   /* 真错误 */
+     }
+     free(c);
+     mutex_lock(&s->peer_lk);
+     if (s->peer_fd != BADSOCK) send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
+     mutex_unlock(&s->peer_lk);
+     session_terminate(s);
+     return NULL;
+ }
 
 static int process_response_data_a_side(sess_t* s, const char* data, size_t data_len) {
     /* A 侧处理响应数据，检测响应头并重写 Location */
 
     if (!s->is_initiator) {
         /* B 侧直接转发 */
-        return wfull(s->app_fd, data, data_len);
+        return wfull_app(s, data, data_len);
     }
 
     /* 如果响应头还没处理完 */
@@ -1007,13 +1251,13 @@ static int process_response_data_a_side(sess_t* s, const char* data, size_t data
                 /* 太大，放弃重写，发送已缓冲的数据 */
                 s->resp_header_complete = -1;
                 LOG("response header too large, giving up Location rewrite");
-                if (wfull(s->app_fd, s->resp_header_buf, s->resp_header_len) < 0) {
+                if (wfull_app(s, s->resp_header_buf, s->resp_header_len) < 0) {
                     return -1;
                 }
                 free(s->resp_header_buf);
                 s->resp_header_buf = NULL;
                 s->resp_header_len = 0;
-                return wfull(s->app_fd, data, data_len);
+                return wfull_app(s, data, data_len);
             }
             char* new_buf = (char*)realloc(s->resp_header_buf, new_cap);
             if (!new_buf) return -1;
@@ -1047,7 +1291,7 @@ static int process_response_data_a_side(sess_t* s, const char* data, size_t data
         size_t to_send_len = rewritten ? strlen(rewritten) : header_size;
 
         /* 发送响应头 */
-        if (wfull(s->app_fd, to_send, to_send_len) < 0) {
+        if (wfull_app(s, to_send, to_send_len) < 0) {
             if (rewritten) free(rewritten);
             return -1;
         }
@@ -1057,7 +1301,7 @@ static int process_response_data_a_side(sess_t* s, const char* data, size_t data
         /* 发送响应头之后的 body 数据 */
         size_t body_in_buf = s->resp_header_len - header_size;
         if (body_in_buf > 0) {
-            if (wfull(s->app_fd, s->resp_header_buf + header_size, body_in_buf) < 0) {
+            if (wfull_app(s, s->resp_header_buf + header_size, body_in_buf) < 0) {
                 return -1;
             }
         }
@@ -1072,7 +1316,7 @@ static int process_response_data_a_side(sess_t* s, const char* data, size_t data
     }
 
     /* 响应头已处理，直接转发数据 */
-    return wfull(s->app_fd, data, data_len);
+    return wfull_app(s, data, data_len);
 }
 
 
@@ -1137,7 +1381,7 @@ static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
                 rc = process_response_data_a_side(s, d, (size_t)use);
             }
             else {
-                rc = wfull(s->app_fd, d, (size_t)use);
+                rc = wfull_app(s, d, (size_t)use);
             }
 
             if (rc < 0) {
@@ -1225,15 +1469,60 @@ typedef struct {
     sock_t fd;
     char* buf;
     size_t cap, len, off;
+    sess_t* sess; /* 关联会话, 用于活动超时(可为 NULL) */
+    int64_t start_ms;      /* 新增: 无 sess 时的起始时间戳 */
+    int     init_timeout;  /* 新增: 无 sess 时的首请求超时(秒), 0=不限 */
 } httpin_t;
 
 static void hin_init(httpin_t* h, sock_t fd) {
-    h->fd = fd; h->cap = 8192; h->len = 0; h->off = 0; h->buf = (char*)malloc(h->cap);
+    h->fd = fd; h->cap = 8192; h->len = 0; h->off = 0; h->sess = NULL;
+    h->start_ms = now_ms();
+    h->init_timeout = g_client_io_timeout;
+    h->buf = (char*)malloc(h->cap);
 }
 static void hin_free(httpin_t* h) { free(h->buf); h->buf = NULL; }
 static void hin_compact(httpin_t* h) {
     if (h->off > 0) { memmove(h->buf, h->buf + h->off, h->len - h->off); h->len -= h->off; h->off = 0; }
 }
+
+/* 从 in->fd 读一次数据到 buf 末尾, 带活动超时语义。
+ * 返回 >0 读到的字节数; 0 对端关闭; -1 真错误/超时/关闭 */
+static int hin_recv_once(httpin_t* h) {
+    for (;;) {
+        if (h->sess && h->sess->closing) return -1;
+        int r = recv(h->fd, h->buf + h->len, (int)(h->cap - h->len - 1), 0);
+        if (r > 0) {
+            if (h->sess) {
+                sess_touch_activity(h->sess);     /* 有 sess: 刷新会话活动时间 */
+            }
+            else {
+                h->start_ms = now_ms();           /* 无 sess: 刷新首请求计时基准 */
+            }
+            return r;
+        }
+        if (r == 0) return 0;
+        if (sock_is_eintr()) continue;
+        if (sock_is_timeout()) {
+            if (h->sess) {
+                /* 有会话: 用会话级活动超时判断 */
+                if (!sess_app_timed_out(h->sess)) continue;   /* 续命 */
+                LOG("app recv activity timeout sid=%llu", (unsigned long long)h->sess->sid);
+                return -1;                                    /* 真超时 */
+            }
+            else {
+                /* 无会话(首请求阶段): 用 init_timeout 判断 */
+                if (h->init_timeout <= 0) continue;           /* 不限 -> 继续等 */
+                if (now_ms() - h->start_ms >= (int64_t)h->init_timeout * 1000) {
+                    LOG("first request read timeout");
+                    return -1;                                /* 首请求超时 */
+                }
+                continue;                                     /* 未超时 -> 继续等 */
+            }
+        }
+        return -1;   /* 真错误 */
+    }
+}
+
 /* Ensure at least 'need' unconsumed bytes are buffered (reading from socket). */
 static int hin_need(httpin_t* h, size_t need) {
     while (h->len - h->off < need) {
@@ -1243,7 +1532,7 @@ static int hin_need(httpin_t* h, size_t need) {
             if (nc > 64u * 1024 * 1024) return -1;
             char* nb = (char*)realloc(h->buf, nc); if (!nb)return -1; h->buf = nb; h->cap = nc;
         }
-        int r = recv(h->fd, h->buf + h->len, (int)(h->cap - h->len - 1), 0);
+        int r = hin_recv_once(h);
         if (r <= 0) return -1;
         h->len += (size_t)r;
     }
@@ -1265,7 +1554,7 @@ static int hin_read_headers(httpin_t* h, char** hdr, size_t* he) {
             size_t nc = h->cap * 2; if (nc > 1024 * 1024) return -1;
             char* nb = (char*)realloc(h->buf, nc); if (!nb)return -1; h->buf = nb; h->cap = nc;
         }
-        int r = recv(h->fd, h->buf + h->len, (int)(h->cap - h->len - 1), 0);
+        int r = hin_recv_once(h);
         if (r <= 0) return -1;
         h->len += (size_t)r;
     }
@@ -1376,7 +1665,7 @@ static uint64_t gen_sid(void) {
 
 
 static sock_t peer_connect_and_hs(sess_t* s, int resume) {
-    sock_t fd = connect_host(s->ph, s->pp); if (fd == BADSOCK) return BADSOCK;
+    sock_t fd = connect_peer(s->ph, s->pp); if (fd == BADSOCK) return BADSOCK;
     if (!resume) {
         if (send_frame(fd, MSG_OPEN, s->sid, s->open_pl, s->open_len) < 0) { closesock(fd); return BADSOCK; }
         /* OPEN 分支: 先重置 sent=base, 再(由调用方)装 peer_fd */
@@ -1456,6 +1745,9 @@ static void* a_peer_thread(void* arg) {
  * ============================================================ */
 static void* handle_client(void* arg) {
     sock_t cfd = (sock_t)(intptr_t)arg; nodelay_on(cfd);
+    /* 设置客户端 socket 超时 */
+    setup_client_socket(cfd);
+
     httpin_t in; hin_init(&in, cfd);
 
     char* hdr; size_t he;
@@ -1486,6 +1778,10 @@ static void* handle_client(void* arg) {
 
     LOG("new client session sid=%llu -> peer %s:%s target %s:%s",
         (unsigned long long)s->sid, ph, pp, th, tp);
+
+    s->app_io_timeout = g_client_io_timeout;   /* 启用活动超时 */
+    sess_touch_activity(s);                     /* 初始化活动时间 */
+    in.sess = s;                                /* 让后续 hin_* 读走活动超时逻辑 */
 
     session_start_sender(s);
 
@@ -1534,6 +1830,9 @@ static void* handle_client(void* arg) {
  * ============================================================ */
 static void* handle_peer(void* arg) {
     sock_t pfd = (sock_t)(intptr_t)arg; nodelay_on(pfd);
+    /* 设置 peer socket 超时 */
+    setup_peer_socket(pfd);
+
     struct fhdr h; char* pl = NULL; int r = recv_frame(pfd, &h, &pl);
     if (r <= 0) { free(pl); closesock(pfd); return 0; }
 
@@ -1545,7 +1844,8 @@ static void* handle_peer(void* arg) {
         memcpy(addr, pl, addrlen); addr[addrlen] = 0;
         char th[256], tp[32]; parse_hp(addr, th, tp);
 
-        sock_t tfd = connect_host(th, tp);
+        
+        sock_t tfd = connect_with_timeout(th, tp, g_client_connect_timeout);
         if (tfd == BADSOCK) {
             LOG("connect to target %s:%s failed", th, tp); free(pl);
             send_frame(pfd, MSG_CLOSE, h.value, 0, 0); closesock(pfd); return 0;
@@ -1558,6 +1858,12 @@ static void* handle_peer(void* arg) {
 
         sess_t* s = (sess_t*)calloc(1, sizeof * s);
         session_init(s);
+        /* 目标连接(app 侧)用活动超时, 短轮询间隔 */
+        s->app_io_timeout = g_client_io_timeout;
+        set_recv_timeout(tfd, APP_POLL_INTERVAL_SEC);
+        set_send_timeout(tfd, APP_POLL_INTERVAL_SEC);
+        sess_touch_activity(s);
+
         s->app_fd = tfd; s->peer_fd = pfd; s->is_initiator = 0; s->sid = h.value;
         LOG("passive session sid=%llu target %s:%s", (unsigned long long)s->sid, th, tp);
         b_register(s);
@@ -1647,20 +1953,28 @@ static void print_help(const char* prog) {
         "OPTIONS:\n"
         "  -p PORT              Listen port (default: 8080)\n"
         "  -b BYTES             Max buffer size per direction in bytes (default: 64MB)\n"
-        "                       Examples: 104857600 (100MB), 1073741824 (1GB)\n"
         "  -t SECONDS           Reconnect timeout in seconds (default: 60s)\n"
         "  -i MILLISECONDS      Delay between reconnect attempts (default: 500ms)\n"
+        "\n"
+        "  Client-side timeout (HTTP client <-> relay, relay <-> target):\n"
+        "  -cc SECONDS          Client connect timeout (default: 10s)\n"
+        "  -cio SECONDS         Client I/O timeout (default: 30s)\n"
+        "\n"
+        "  Peer-side timeout (relay <-> relay):\n"
+        "  -pc SECONDS          Peer connect timeout (default: 30s)\n"
+        "  -pio SECONDS         Peer I/O timeout (default: 60s)\n"
+        "\n"
         "  -h, --help           Show this help message\n"
         "\n"
         "EXAMPLES:\n"
         "  # Listen on port 8080 with default settings\n"
         "  %s -p 8080\n"
         "\n"
-        "  # Set buffer to 512MB, reconnect timeout to 120s\n"
-        "  %s -p 8080 -b 536870912 -t 120\n"
+        "  # Client side: fast timeout for local connections, Peer side: slow timeout for WAN\n"
+        "  %s -p 8080 -cc 5 -cio 10 -pc 60 -pio 120\n"
         "\n"
-        "  # Aggressive reconnect: try every 100ms, timeout after 30s\n"
-        "  %s -p 8080 -i 100 -t 30\n"
+        "  # Large buffer for slow peer, tight timeouts for clients\n"
+        "  %s -p 8080 -b 1073741824 -pc 60 -pio 180 -cc 5 -cio 15\n"
         "\n"
         "QUICK START:\n"
         "  1. Start relay on Host A (listening on port 8080):\n"
@@ -1713,7 +2027,10 @@ static void print_help(const char* prog) {
 int main(int argc, char** argv) {
 #ifdef _WIN32
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup failed\n"); return 1; }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
 #else
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -1721,31 +2038,58 @@ int main(int argc, char** argv) {
     mutex_init(&g_gen_sid_lk);
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-p") && i + 1 < argc)g_port = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-b") && i + 1 < argc)g_max_buffer = (size_t)strtoull(argv[++i], 0, 10);
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc)g_reconnect_timeout = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-i") && i + 1 < argc)g_reconnect_ms = atoi(argv[++i]);
+        if (!strcmp(argv[i], "-p") && i + 1 < argc)
+            g_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc)
+            g_max_buffer = (size_t)strtoull(argv[++i], 0, 10);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc)
+            g_reconnect_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc)
+            g_reconnect_ms = atoi(argv[++i]);
+        /* Client 超时 */
+        else if (!strcmp(argv[i], "-cc") && i + 1 < argc)
+            g_client_connect_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-cio") && i + 1 < argc)
+            g_client_io_timeout = atoi(argv[++i]);
+        /* Peer 超时 */
+        else if (!strcmp(argv[i], "-pc") && i + 1 < argc)
+            g_peer_connect_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-pio") && i + 1 < argc)
+            g_peer_io_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_help(argv[0]);
             return 0;
         }
-        else { fprintf(stderr, "Usage: %s [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]\n", argv[0]); return 1; }
+        else {
+            fprintf(stderr, "Usage: %s [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]\n"
+                "          [-cc client_connect_timeout] [-cio client_io_timeout]\n"
+                "          [-pc peer_connect_timeout] [-pio peer_io_timeout]\n", argv[0]);
+            return 1;
+        }
     }
 
     sock_t lfd = listen_on(g_port);
-    if (lfd == BADSOCK) { fprintf(stderr, "failed to listen on port %d (err=%d)\n", g_port, sockerrno); return 1; }
+    if (lfd == BADSOCK) {
+        fprintf(stderr, "failed to listen on port %d (err=%d)\n", g_port, sockerrno);
+        return 1;
+    }
     LOG("httprelay listening on :%d  max_buffer=%zu reconnect_timeout=%ds",
         g_port, g_max_buffer, g_reconnect_timeout);
+    LOG("client timeout: connect=%ds, io=%ds", g_client_connect_timeout, g_client_io_timeout);
+    LOG("peer timeout: connect=%ds, io=%ds", g_peer_connect_timeout, g_peer_io_timeout);
 
     for (;;) {
         sock_t fd = accept(lfd, NULL, NULL);
         if (fd == BADSOCK) {
             if (sockerrno == SOCK_EINTR)continue;
-            fprintf(stderr, "accept failed (err=%d)\n", sockerrno); break;
+            fprintf(stderr, "accept failed (err=%d)\n", sockerrno);
+            break;
         }
         thread_t t;
-        if (thread_create(&t, dispatch, (void*)(intptr_t)fd) == 0) thread_detach(t);
-        else closesock(fd);
+        if (thread_create(&t, dispatch, (void*)(intptr_t)fd) == 0)
+            thread_detach(t);
+        else
+            closesock(fd);
     }
 
     mutex_destroy(&g_tbl_lk);
