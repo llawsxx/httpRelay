@@ -373,6 +373,16 @@ typedef struct {
 
     mutex_t   ref_lk;       /* 保护 refcnt（也可用原子操作替代）*/
     int       refcnt;       /* 引用计数 */
+
+    char my_host[256];         /* A side host (where client connects) */
+    char my_port[32];          /* A side port */
+    char target_host[256];
+    char target_port[32];
+
+    char* resp_header_buf;
+    size_t resp_header_cap;
+    size_t resp_header_len;
+    volatile int resp_header_complete;  /* 0=未完成, 1=已完成, -1=不需要重写 */
 }sess_t;
 
 static void* sender_thread(void* arg);
@@ -387,6 +397,14 @@ static void session_init(sess_t* s) {
     s->send_dirty = 0;
     s->refcnt = 1;                 /* owner持有的引用 */
     mutex_init(&s->ref_lk);
+    s->target_host[0] = 0; 
+    s->target_port[0] = 0;
+    s->my_host[0] = 0;
+    s->my_port[0] = 0;
+    s->resp_header_buf = NULL;
+    s->resp_header_cap = 0;
+    s->resp_header_len = 0;
+    s->resp_header_complete = 0;
 }
 static void session_start_sender(sess_t* s) {
     s->send_running = 1;
@@ -410,6 +428,10 @@ static void session_uninit(sess_t* s) {
         free(s->open_pl);
         s->open_pl = NULL;
         s->open_len = 0;
+    }
+    if (s->resp_header_buf) {
+        free(s->resp_header_buf);
+        s->resp_header_buf = NULL;
     }
 }
 
@@ -665,6 +687,278 @@ static int rewrite_request(const char* hdr, size_t he,
     *out_rw = ob; *out_rl = (uint32_t)ol; free(h); return 0;
 }
 
+/*
+ * 从响应头中提取 Location 头的值
+ * 返回: Location 的值（指向原始缓冲内部），或 NULL
+ */
+static const char* find_location_header(const char* resp, size_t resp_len, size_t* loc_len) {
+    const char* line = resp;
+    const char* end = resp + resp_len;
+
+    /* 跳过状态行 */
+    const char* crlf = (const char*)memmem(resp, resp_len, "\r\n", 2);
+    if (!crlf) return NULL;
+    line = crlf + 2;
+
+    /* 查找 Location 头 */
+    while (line < end) {
+        const char* next_crlf = (const char*)memmem(line, (size_t)(end - line), "\r\n", 2);
+        if (!next_crlf) break;
+
+        size_t line_len = (size_t)(next_crlf - line);
+        if (line_len == 0) break;  /* 空行，头部结束 */
+
+        if (strncasecmp(line, "Location:", 9) == 0) {
+            const char* val = line + 9;
+            /* 跳过冒号后的空格 */
+            while (val < next_crlf && (*val == ' ' || *val == '\t')) val++;
+            *loc_len = (size_t)(next_crlf - val);
+            return val;
+        }
+
+        line = next_crlf + 2;
+    }
+
+    return NULL;
+}
+
+/*
+ * 检查是否是重定向响应 (3xx)
+ */
+static int is_redirect_response(const char* resp, size_t resp_len) {
+    /* 格式: "HTTP/1.x NNN ..." */
+    if (resp_len < 12) return 0;
+
+    const char* status_start = (const char*)memmem(resp, resp_len, " ", 1);
+    if (!status_start) return 0;
+    status_start++;
+
+    int code = atoi(status_start);
+    return (code >= 300 && code < 400);
+}
+
+
+/*
+ * 重写 Location 头
+ * 格式: http://peer_host:peer_port/b_side/target_host:target_port/path
+ *
+ * 其中:
+ *   peer_host:peer_port = A 侧地址（客户端连接的地址）
+ *   b_side = B 侧地址 (relay-b:port)
+ *   target_host:target_port = 最终目标地址
+ *   path = 重定向目标的路径
+ */
+static int rewrite_location(
+    const char* a_peer_host, const char* a_peer_port,
+    const char* b_side_host, const char* b_side_port,
+    const char* target_host, const char* target_port,
+    const char* location, size_t loc_len,
+    char* out_buf, size_t out_bufsize)
+{
+    const char* path = NULL;
+    size_t path_len = 0;
+    int is_absolute = 0;
+    const char* host_path_start = NULL;
+    size_t host_path_len = 0;
+    int is_https = 0;
+    /* 检查是否是绝对 URL */
+    if (strncasecmp(location, "http://", 7) == 0 ||
+        (is_https = strncasecmp(location, "https://", 8) == 0)) {
+        if (is_https) {
+            LOG("Location rewrite for https is not supported");
+            return -1;
+        }
+        const char* scheme_end = (const char*)memmem(location, loc_len, "://", 3);
+        if (!scheme_end) {
+            if (loc_len >= out_bufsize) return -1;
+            memcpy(out_buf, location, loc_len);
+            out_buf[loc_len] = 0;
+            return (int)loc_len;
+        }
+
+        /* 跳过 "://"，保留 "host:port/path" 部分 */
+        host_path_start = scheme_end + 3;
+        host_path_len = loc_len - (host_path_start - location);
+
+        is_absolute = 1;
+    }
+    else if (*location == '/') {
+        /* 相对路径 */
+        path = location;
+        path_len = loc_len;
+    }
+    else {
+        /* 其他格式，原样返回 */
+        if (loc_len >= out_bufsize) return -1;
+        memcpy(out_buf, location, loc_len);
+        out_buf[loc_len] = 0;
+        return (int)loc_len;
+    }
+
+    /* 检查 IPv6 */
+    int v6_a_peer = strchr(a_peer_host, ':') != NULL;
+    int v6_b_side = strchr(b_side_host, ':') != NULL;
+
+    int pos = 0;
+    int ret = 0;
+
+    /* 第一部分: http://a_peer_host:a_peer_port/ */
+    if (v6_a_peer) {
+        ret = snprintf(out_buf, out_bufsize, "http://[%s]:%s/",
+            a_peer_host, a_peer_port);
+    }
+    else {
+        ret = snprintf(out_buf, out_bufsize, "http://%s:%s/",
+            a_peer_host, a_peer_port);
+    }
+    if (ret < 0 || (size_t)ret >= out_bufsize) return -1;
+    pos = ret;
+
+    /* 第二部分: relay/ */
+    ret = snprintf(out_buf + pos, out_bufsize - pos, "relay/");
+    if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
+    pos += ret;
+
+    /* 第三部分: b_side_host:b_side_port/ */
+    if (v6_b_side) {
+        ret = snprintf(out_buf + pos, out_bufsize - pos, "[%s]:%s/",
+            b_side_host, b_side_port);
+    }
+    else {
+        ret = snprintf(out_buf + pos, out_bufsize - pos, "%s:%s/",
+            b_side_host, b_side_port);
+    }
+    if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
+    pos += ret;
+
+    /* 绝对 URL：直接追加 host:port/path（去掉 http://） */
+    if (is_absolute) {
+        if ((size_t)pos + host_path_len >= out_bufsize) return -1;
+        memcpy(out_buf + pos, host_path_start, host_path_len);
+        pos += (int)host_path_len;
+        out_buf[pos] = 0;
+        return pos;
+    }
+
+    /* 相对路径：需要插入 target_host:target_port，然后追加路径 */
+    int v6_target = strchr(target_host, ':') != NULL;
+    if (v6_target) {
+        ret = snprintf(out_buf + pos, out_bufsize - pos, "[%s]:%s",
+            target_host, target_port);
+    }
+    else {
+        ret = snprintf(out_buf + pos, out_bufsize - pos, "%s:%s",
+            target_host, target_port);
+    }
+    if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
+    pos += ret;
+
+    /* 追加路径部分 */
+    if (path_len > 0) {
+        if ((size_t)pos + path_len >= out_bufsize) return -1;
+        memcpy(out_buf + pos, path, path_len);
+        pos += (int)path_len;
+    }
+
+    out_buf[pos] = 0;
+    return pos;
+}
+
+
+/*
+ * 重写响应头中的 Location 头
+ * 返回: 修改后的响应头（malloc），需要 free；或 NULL 表示无需修改
+ */
+ static char* rewrite_response_location(
+     const char* resp, size_t resp_len,
+     const char* a_peer_host, const char* a_peer_port,
+     const char* b_side_host, const char* b_side_port,
+     const char* target_host, const char* target_port)
+ {
+     if (!is_redirect_response(resp, resp_len)) {
+         return NULL;
+     }
+
+     size_t loc_len = 0;
+     const char* location = find_location_header(resp, resp_len, &loc_len);
+     if (!location) {
+         return NULL;
+     }
+
+     char new_location[4096];
+     int new_loc_len = rewrite_location(
+         a_peer_host, a_peer_port,
+         b_side_host, b_side_port,
+         target_host, target_port,
+         location, loc_len,
+         new_location, sizeof new_location
+     );
+
+     if (new_loc_len < 0) {
+         /* 无需修改或出错 */
+         LOG("WARNING: Location rewrite failed, location_len=%zu",
+             loc_len);
+         return NULL;
+     }
+
+     LOG("Location rewrite: %.*s -> %s",
+         (int)loc_len, location, new_location);
+
+     /* 构造新的响应头 */
+     size_t new_resp_len = resp_len - loc_len + (size_t)new_loc_len + 100;
+     char* new_resp = (char*)malloc(new_resp_len);
+     if (!new_resp) return NULL;
+
+     const char* crlf = (const char*)memmem(resp, resp_len, "\r\n", 2);
+     if (!crlf) {
+         free(new_resp);
+         return NULL;
+     }
+
+     size_t status_line_len = (size_t)(crlf - resp) + 2;
+     memcpy(new_resp, resp, status_line_len);
+     size_t pos = status_line_len;
+
+     const char* line = resp + status_line_len;
+     const char* end = resp + resp_len;
+
+     while (line < end) {
+         const char* next_crlf = (const char*)memmem(line, (size_t)(end - line), "\r\n", 2);
+         if (!next_crlf) {
+             size_t remaining = (size_t)(end - line);
+             if (pos + remaining <= new_resp_len) {
+                 memcpy(new_resp + pos, line, remaining);
+                 pos += remaining;
+             }
+             break;
+         }
+
+         size_t line_len = (size_t)(next_crlf - line);
+
+         if (strncasecmp(line, "Location:", 9) == 0) {
+             /* 重写 Location 行 */
+             int write_len = snprintf(new_resp + pos, new_resp_len - pos,
+                 "Location: %s\r\n", new_location);
+             if (write_len > 0) {
+                 pos += (size_t)write_len;
+             }
+         }
+         else if (line_len > 0) {
+             /* 其他行原样复制 */
+             if (pos + line_len + 2 <= new_resp_len) {
+                 memcpy(new_resp + pos, line, line_len);
+                 pos += line_len;
+                 memcpy(new_resp + pos, "\r\n", 2);
+                 pos += 2;
+             }
+         }
+
+         line = next_crlf + 2;
+     }
+     new_resp[pos] = 0;
+     return new_resp;
+ }
+
 
 /* Used by B side (target->B->A) and as a generic app->peer pump. */
 static void* t_app2peer(void* a) {
@@ -688,6 +982,140 @@ static void* t_app2peer(void* a) {
     return NULL;
 }
 
+static int process_response_data_a_side(sess_t* s, const char* data, size_t data_len) {
+    /* A 侧处理响应数据，检测响应头并重写 Location */
+
+    if (!s->is_initiator) {
+        /* B 侧直接转发 */
+        return wfull(s->app_fd, data, data_len);
+    }
+
+    /* 如果响应头还没处理完 */
+    if (s->resp_header_complete == 0) {
+        /* 缓冲数据以查找完整的响应头 */
+        if (!s->resp_header_buf) {
+            s->resp_header_cap = 16384;
+            s->resp_header_buf = (char*)malloc(s->resp_header_cap);
+            if (!s->resp_header_buf) return -1;
+        }
+
+        /* 检查缓冲大小 */
+        if (s->resp_header_len + data_len > s->resp_header_cap) {
+            size_t new_cap = s->resp_header_cap * 2;
+            while (new_cap < s->resp_header_len + data_len) new_cap *= 2;
+            if (new_cap > 10 * 1024 * 1024) {
+                /* 太大，放弃重写，发送已缓冲的数据 */
+                s->resp_header_complete = -1;
+                LOG("response header too large, giving up Location rewrite");
+                if (wfull(s->app_fd, s->resp_header_buf, s->resp_header_len) < 0) {
+                    return -1;
+                }
+                free(s->resp_header_buf);
+                s->resp_header_buf = NULL;
+                s->resp_header_len = 0;
+                return wfull(s->app_fd, data, data_len);
+            }
+            char* new_buf = (char*)realloc(s->resp_header_buf, new_cap);
+            if (!new_buf) return -1;
+            s->resp_header_buf = new_buf;
+            s->resp_header_cap = new_cap;
+        }
+
+        /* 追加新数据 */
+        memcpy(s->resp_header_buf + s->resp_header_len, data, data_len);
+        s->resp_header_len += data_len;
+
+        /* 查找响应头结束 */
+        char* header_end = (char*)memmem(s->resp_header_buf, s->resp_header_len, "\r\n\r\n", 4);
+        if (!header_end) {
+            /* 还没接收完整响应头 */
+            return 0;
+        }
+
+        /* 找到完整响应头 */
+        size_t header_size = (size_t)(header_end - s->resp_header_buf) + 4;
+
+        /* 尝试重写 Location */
+        char* rewritten = rewrite_response_location(
+            s->resp_header_buf, header_size,
+            s->my_host, s->my_port,
+            s->ph, s->pp,
+            s->target_host, s->target_port
+        );
+
+        const char* to_send = rewritten ? rewritten : s->resp_header_buf;
+        size_t to_send_len = rewritten ? strlen(rewritten) : header_size;
+
+        /* 发送响应头 */
+        if (wfull(s->app_fd, to_send, to_send_len) < 0) {
+            if (rewritten) free(rewritten);
+            return -1;
+        }
+
+        if (rewritten) free(rewritten);
+
+        /* 发送响应头之后的 body 数据 */
+        size_t body_in_buf = s->resp_header_len - header_size;
+        if (body_in_buf > 0) {
+            if (wfull(s->app_fd, s->resp_header_buf + header_size, body_in_buf) < 0) {
+                return -1;
+            }
+        }
+
+        /* 清理缓冲 */
+        free(s->resp_header_buf);
+        s->resp_header_buf = NULL;
+        s->resp_header_len = 0;
+        s->resp_header_complete = 1;
+
+        return 0;
+    }
+
+    /* 响应头已处理，直接转发数据 */
+    return wfull(s->app_fd, data, data_len);
+}
+
+
+static void get_socket_address(sock_t fd, char* host, char* port) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof ss;
+
+    if (getsockname(fd, (struct sockaddr*)&ss, &len) == 0) {
+        char hbuf[256];
+        char pbuf[32];
+
+        // 处理 IPv4-mapped IPv6
+        if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&ss;
+            if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+                struct sockaddr_in sin4;
+                memset(&sin4, 0, sizeof sin4);
+                sin4.sin_family = AF_INET;
+                sin4.sin_port = sin6->sin6_port;
+                memcpy(&sin4.sin_addr, &sin6->sin6_addr.s6_addr[12], 4);
+
+                if (getnameinfo((struct sockaddr*)&sin4, sizeof sin4,
+                    hbuf, sizeof hbuf, pbuf, sizeof pbuf,
+                    NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+                    snprintf(host, 256, "%s", hbuf);
+                    snprintf(port, 32, "%s", pbuf);
+                    return;
+                }
+            }
+        }
+
+        if (getnameinfo((struct sockaddr*)&ss, len, hbuf, sizeof hbuf,
+            pbuf, sizeof pbuf, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+            snprintf(host, 256, "%s", hbuf);
+            snprintf(port, 32, "%s", pbuf);
+            return;
+        }
+    }
+
+    snprintf(host, 256, "localhost");
+    snprintf(port, 32, "8080");
+}
+
 
 static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
     switch (h->type) {
@@ -702,10 +1130,21 @@ static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
         }
         if ((uint64_t)off + dl <= want) { use = 0; newoff = want; }       /* 完全重复 */
         else { uint64_t sk = want - off; d += (size_t)sk; use = (uint32_t)(dl - sk); newoff = off + dl; }
-        if (use) { 
-            if (wfull(s->app_fd, d, use) < 0) { 
-                free(pl); session_terminate(s); return 0; 
-            } 
+
+        if (use) {
+            int rc;
+            if (s->is_initiator && use > 0) {
+                rc = process_response_data_a_side(s, d, (size_t)use);
+            }
+            else {
+                rc = wfull(s->app_fd, d, (size_t)use);
+            }
+
+            if (rc < 0) {
+                free(pl);
+                session_terminate(s);
+                return 0;
+            }
         }
         mutex_lock(&s->recv_lk); if (newoff > s->recv_off)s->recv_off = newoff;
         uint64_t ack = s->recv_off; mutex_unlock(&s->recv_lk);
@@ -1033,8 +1472,13 @@ static void* handle_client(void* arg) {
     s->app_fd = cfd; s->peer_fd = BADSOCK; s->is_initiator = 1; s->sid = gen_sid();
     snprintf(s->ph, sizeof s->ph, "%s", ph); snprintf(s->pp, sizeof s->pp, "%s", pp);
 
+    /* 保存原始信息用于重定向重写 */
+    get_socket_address(cfd, s->my_host, s->my_port);
+    snprintf(s->target_host, sizeof s->target_host, "%s", th);
+    snprintf(s->target_port, sizeof s->target_port, "%s", tp);
+
     char tgt[400]; int v6 = strchr(th, ':') != NULL;
-    if (v6)snprintf(tgt, sizeof tgt, "[%s]:%s\n", th, tp); else snprintf(tgt, sizeof tgt, "%s:%s\n", th, tp);
+    if (v6) snprintf(tgt, sizeof tgt, "[%s]:%s\n", th, tp); else snprintf(tgt, sizeof tgt, "%s:%s\n", th, tp);
     size_t tl = strlen(tgt);
     s->open_len = (uint32_t)(tl + rl); s->open_pl = (char*)malloc(s->open_len);
     memcpy(s->open_pl, tgt, tl); memcpy(s->open_pl + tl, rw, rl);
