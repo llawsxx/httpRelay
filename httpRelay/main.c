@@ -1808,10 +1808,28 @@ static int a_forward_body(sess_t* s, httpin_t* in, const char* hdr, size_t he) {
  * ============================================================ */
 static mutex_t g_gen_sid_lk;
 
+static uint64_t splitmix64_next(uint64_t* state) {
+    uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
 static uint64_t gen_sid(void) {
-    static uint64_t c = 0;
     mutex_lock(&g_gen_sid_lk);
-    uint64_t v = (((uint64_t)now_ms()) << 16) ^ (++c);
+    static uint64_t state = 0;
+    if (state == 0) {
+        uint64_t seed = (uint64_t)now_ms() ^ ((uint64_t)time(NULL) << 32);
+        seed ^= (uint64_t)(uintptr_t)&state;
+#ifdef _WIN32
+        seed ^= ((uint64_t)GetCurrentProcessId()) << 16;
+#else
+        seed ^= ((uint64_t)getpid()) << 16;
+#endif
+        state = seed ? seed : 0x72656c6179736964ULL;
+    }
+    uint64_t v = splitmix64_next(&state);
+    if (v == 0) v = splitmix64_next(&state);
     mutex_unlock(&g_gen_sid_lk);
     return v;
 }
