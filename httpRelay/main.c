@@ -1175,8 +1175,8 @@ static int rewrite_location(
                  pos += (size_t)write_len;
              }
          }
-         else if (line_len > 0) {
-             /* 其他行原样复制 */
+         else{
+             // 所有行（包括空行）原样复制
              if (pos + line_len + 2 <= new_resp_len) {
                  memcpy(new_resp + pos, line, line_len);
                  pos += line_len;
@@ -1813,6 +1813,7 @@ static void* handle_client(void* arg) {
             wfull(cfd, e, strlen(e)); break;
         }
         in.off += he2;
+        s->resp_header_complete = 0;
         if (a_inject(s, rw2, rl2) < 0) { free(rw2); break; }
         free(rw2);
         if (a_forward_body(s, &in, h2, he2) < 0) break;
