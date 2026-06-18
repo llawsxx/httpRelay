@@ -168,6 +168,7 @@ static int  cond_wait_ms(cond_t* c, mutex_t* m, int ms) {
 #include <stdint.h>
 #include <errno.h>
 #include <time.h>
+#include "aes.h"
 
  /* ============================================================
   *  Configurable parameters
@@ -181,6 +182,9 @@ static int    g_client_io_timeout = 120;         /* 客户端 I/O 超时 (秒) *
 static int    g_peer_connect_timeout = 10;      /* Peer 间连接超时 (秒) */
 static int    g_peer_io_timeout = 20;           /* Peer 间 I/O 超时 (秒) */
 static int    g_heartbeat_interval = 5;         /* Peer 心跳发送间隔 (秒) */
+static int    g_crypto_enabled = 0;             /* A<->B payload AES-CTR encryption */
+static uint8_t g_crypto_key[16];
+static uint32_t g_crypto_schedule[60];
 #define IO_CHUNK 32768
 #define APP_POLL_INTERVAL_SEC 2
 
@@ -214,12 +218,68 @@ static void format_log_time(char* buf, size_t len) {
 
 #define LOG(f,...) do{ char _log_ts[32]; format_log_time(_log_ts,sizeof(_log_ts)); fprintf(stderr,"[%s] " f "\n",_log_ts,##__VA_ARGS__); }while(0)
 
+static uint64_t splitmix64_next(uint64_t* state);
+
+static void put64be(uint8_t* p, uint64_t v) {
+    for (int i = 7; i >= 0; i--) { p[i] = (uint8_t)v; v >>= 8; }
+}
+
+static uint64_t get64be(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+static uint64_t g_crypto_nonce_state = 0;
+
+static uint64_t crypto_next_nonce(void) {
+    if (g_crypto_nonce_state == 0) {
+        uint64_t seed = (uint64_t)now_ms() ^ ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)&g_crypto_nonce_state;
+#ifdef _WIN32
+        seed ^= ((uint64_t)GetCurrentProcessId()) << 24;
+#else
+        seed ^= ((uint64_t)getpid()) << 24;
+#endif
+        g_crypto_nonce_state = seed ? seed : 0x63727970746f6e63ULL;
+    }
+    return splitmix64_next(&g_crypto_nonce_state);
+}
+
+static void crypto_make_iv(uint64_t nonce, uint8_t iv[AES_BLOCK_SIZE]) {
+    memset(iv, 0, AES_BLOCK_SIZE);
+    put64be(iv, nonce);
+}
+
+static void crypto_set_password(const char* password) {
+    uint64_t st = 0x6a09e667f3bcc909ULL;
+    const unsigned char* p = (const unsigned char*)password;
+    while (*p) {
+        st ^= (uint64_t)(*p++);
+        st = splitmix64_next(&st);
+    }
+    put64be(g_crypto_key, splitmix64_next(&st));
+    put64be(g_crypto_key + 8, splitmix64_next(&st));
+    aes_key_setup(g_crypto_key, g_crypto_schedule, AES_KEY_SIZE);
+    g_crypto_enabled = 1;
+}
+
+static const uint64_t CRYPTO_MAGIC = 0x4854524c41594531ULL; /* HTRLAYE1 */
+
+static void crypto_auth_response(uint64_t challenge, uint8_t out[16]) {
+    uint8_t plain[16], iv[AES_BLOCK_SIZE];
+    put64be(plain, 0x4854524c41555448ULL); /* HTRLAUTH */
+    put64be(plain + 8, challenge);
+    memset(iv, 0, sizeof iv);
+    aes_encrypt_ctr(plain, sizeof plain, out, g_crypto_schedule, AES_KEY_SIZE, iv);
+}
+
 /* ============================================================
  *  A<->B frame protocol
  * ============================================================ */
 enum {
     MSG_OPEN = 1, MSG_RESUME = 2, MSG_RESUME_ACK = 3, MSG_DATA = 4,
-    MSG_ACK = 5, MSG_CLOSE = 6, MSG_PING = 7, MSG_PONG = 8
+    MSG_ACK = 5, MSG_CLOSE = 6, MSG_PING = 7, MSG_PONG = 8,
+    MSG_AUTH_REQ = 250, MSG_AUTH_OK = 251, MSG_AUTH_FAIL = 252
 };
 
 #pragma pack(push,1)
@@ -284,14 +344,19 @@ static int rfull(sock_t fd, void* b, size_t n) {
 
 static void nodelay_on(sock_t fd) { int o = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&o, sizeof o); }
 
-static int send_frame(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t pn) {
+static int is_peer_msg_type(uint8_t t) {
+    return (t >= MSG_OPEN && t <= MSG_PONG) ||
+        t == MSG_AUTH_REQ || t == MSG_AUTH_OK || t == MSG_AUTH_FAIL;
+}
+
+static int send_frame_raw(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t pn) {
     struct fhdr h; h.type = t; h.r1 = 0; h.r2 = 0; h.value = sw64(v); h.plen = sw32(pn);
     if (wfull(fd, &h, sizeof h) < 0) return -1;
-    if (pn && pl)return wfull(fd, pl, pn);
+    if (pn && pl) return wfull(fd, pl, pn);
     return 0;
 }
 
-static int recv_frame(sock_t fd, struct fhdr* h, char** pl) {
+static int recv_frame_raw(sock_t fd, struct fhdr* h, char** pl) {
     int r = rfull(fd, h, sizeof * h); if (r <= 0) return r;
     h->value = sw64(h->value); h->plen = sw32(h->plen); *pl = NULL;
     if (h->plen) {
@@ -300,6 +365,127 @@ static int recv_frame(sock_t fd, struct fhdr* h, char** pl) {
         r = rfull(fd, *pl, h->plen); if (r <= 0) { free(*pl); *pl = NULL; return r ? r : -1; }
     }
     return 1;
+}
+
+static int send_frame(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t pn) {
+    char* enc = NULL;
+    uint32_t wire_pn = pn;
+    const void* wire_pl = pl;
+
+    if (g_crypto_enabled) {
+        if (pn > 64u * 1024 * 1024 - 16u) return -1;
+        wire_pn = pn + 16;
+        enc = (char*)malloc(wire_pn);
+        if (!enc) return -1;
+        uint64_t nonce = crypto_next_nonce();
+        put64be((uint8_t*)enc, nonce);
+        put64be((uint8_t*)enc + 8, CRYPTO_MAGIC);
+        if (pn && pl) memcpy(enc + 16, pl, pn);
+        uint8_t iv[AES_BLOCK_SIZE];
+        crypto_make_iv(nonce, iv);
+        aes_encrypt_ctr((const uint8_t*)enc + 8, pn + 8, (uint8_t*)enc + 8,
+            g_crypto_schedule, AES_KEY_SIZE, iv);
+        wire_pl = enc;
+    }
+
+    int rc = send_frame_raw(fd, t, v, wire_pl, wire_pn);
+    free(enc);
+    return rc;
+}
+
+static int recv_frame(sock_t fd, struct fhdr* h, char** pl) {
+    int r = recv_frame_raw(fd, h, pl); if (r <= 0) return r;
+    if (g_crypto_enabled) {
+        if (h->plen < 16 || !*pl) { free(*pl); *pl = NULL; return -1; }
+        uint64_t nonce = get64be((const uint8_t*)*pl);
+        uint32_t plain_len = h->plen - 16;
+        uint8_t iv[AES_BLOCK_SIZE];
+        crypto_make_iv(nonce, iv);
+        aes_decrypt_ctr((const uint8_t*)*pl + 8, plain_len + 8, (uint8_t*)*pl + 8,
+            g_crypto_schedule, AES_KEY_SIZE, iv);
+        if (get64be((const uint8_t*)*pl + 8) != CRYPTO_MAGIC) {
+            LOG("encrypted peer frame authentication failed");
+            free(*pl); *pl = NULL; return -1;
+        }
+        if (plain_len > 0) memmove(*pl, *pl + 16, plain_len);
+        h->plen = plain_len;
+    }
+    return 1;
+}
+
+static int peer_auth_client(sock_t fd) {
+    if (!g_crypto_enabled) return 0;
+    uint64_t challenge = crypto_next_nonce();
+    if (send_frame_raw(fd, MSG_AUTH_REQ, challenge, 0, 0) < 0) return -1;
+
+    struct fhdr h; char* pl = NULL;
+    int r = recv_frame_raw(fd, &h, &pl);
+    if (r <= 0) { free(pl); return -1; }
+    if (h.type != MSG_AUTH_OK || h.value != challenge || h.plen != 16 || !pl) {
+        free(pl); return -1;
+    }
+    uint8_t expected[16];
+    crypto_auth_response(challenge, expected);
+    int ok = memcmp(pl, expected, sizeof expected) == 0;
+    free(pl);
+    return ok ? 0 : -1;
+}
+
+static int peer_auth_server(sock_t fd, struct fhdr* first, char** first_pl) {
+    int r = recv_frame_raw(fd, first, first_pl);
+    if (r <= 0) {
+        LOG("peer auth/server: failed to read first frame");
+        return r;
+    }
+
+    if (first->type == MSG_AUTH_REQ) {
+        free(*first_pl); *first_pl = NULL;
+        if (!g_crypto_enabled) {
+            LOG("peer auth/server: client requires password but server has no -k configured");
+            send_frame_raw(fd, MSG_AUTH_FAIL, first->value, 0, 0);
+            return -2;
+        }
+        uint8_t resp[16];
+        crypto_auth_response(first->value, resp);
+        if (send_frame_raw(fd, MSG_AUTH_OK, first->value, resp, sizeof resp) < 0) {
+            LOG("peer auth/server: failed to send auth response");
+            return -1;
+        }
+        r = recv_frame(fd, first, first_pl);
+        if (r <= 0) LOG("peer auth/server: authenticated but failed to read encrypted first frame");
+        return r;
+    }
+
+    if (g_crypto_enabled) {
+        send_frame_raw(fd, MSG_AUTH_FAIL, 0, 0, 0);
+        free(*first_pl); *first_pl = NULL;
+        LOG("peer auth/server: encrypted server requires MSG_AUTH_REQ before type=%u", (unsigned)first->type);
+        return -2;
+    }
+    return 1;
+}
+
+static void wait_peer_close_after_auth_fail(sock_t fd) {
+    char c;
+    int64_t end = now_ms() + 2000;
+    while (now_ms() < end) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int remain = (int)(end - now_ms());
+        if (remain <= 0) break;
+        struct timeval tv;
+        tv.tv_sec = remain / 1000;
+        tv.tv_usec = (remain % 1000) * 1000;
+        int sr = select((int)fd + 1, &rfds, NULL, NULL, &tv);
+        if (sr <= 0) return;
+        int r = recv(fd, &c, 1, 0);
+        if (r == 0) return;
+        if (r < 0) {
+            if (sock_is_eintr()) continue;
+            return;
+        }
+    }
 }
 
 /* ============================================================
@@ -1552,6 +1738,11 @@ static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
     case MSG_ACK: 
         sw_drop_to(&s->out, h->value); free(pl); return 1;
     case MSG_CLOSE: free(pl); session_terminate(s); return 0;
+    case MSG_AUTH_FAIL:
+        LOG("peer authentication rejected sid=%llu", (unsigned long long)s->sid);
+        free(pl);
+        session_terminate(s);
+        return 0;
     case MSG_PING:
         mutex_lock(&s->peer_lk);
         if (s->peer_fd != BADSOCK && send_frame(s->peer_fd, MSG_PONG, h->value, 0, 0) < 0) {
@@ -1853,6 +2044,11 @@ static void normalize_timeouts(void) {
 
 static sock_t peer_connect_and_hs(sess_t* s, int resume) {
     sock_t fd = connect_peer(s->ph, s->pp); if (fd == BADSOCK) return BADSOCK;
+    if (peer_auth_client(fd) < 0) {
+        LOG("peer authentication failed sid=%llu", (unsigned long long)s->sid);
+        closesock(fd);
+        return BADSOCK;
+    }
     if (!resume) {
         if (send_frame(fd, MSG_OPEN, s->sid, s->open_pl, s->open_len) < 0) { closesock(fd); return BADSOCK; }
         /* OPEN 分支: 先重置 sent=base, 再(由调用方)装 peer_fd */
@@ -2020,12 +2216,16 @@ static void* handle_peer(void* arg) {
     /* 设置 peer socket 超时 */
     setup_peer_socket(pfd);
 
-    struct fhdr h; char* pl = NULL; int r = recv_frame(pfd, &h, &pl);
-    if (r <= 0) { free(pl); closesock(pfd); return 0; }
+    struct fhdr h; char* pl = NULL; int r = peer_auth_server(pfd, &h, &pl);
+    if (r <= 0) {
+        LOG("peer/server: connection rejected before OPEN/RESUME");
+        if (r == -2) wait_peer_close_after_auth_fail(pfd);
+        free(pl); closesock(pfd); return 0;
+    }
 
     if (h.type == MSG_OPEN) {
         char* nl = (char*)memchr(pl, '\n', h.plen);
-        if (!nl) { free(pl); closesock(pfd); return 0; }
+        if (!nl) { LOG("peer/server: invalid OPEN payload"); free(pl); closesock(pfd); return 0; }
         size_t addrlen = (size_t)(nl - pl); char addr[400];
         if (addrlen >= sizeof addr)addrlen = sizeof addr - 1;
         memcpy(addr, pl, addrlen); addr[addrlen] = 0;
@@ -2116,6 +2316,7 @@ static void* handle_peer(void* arg) {
         session_release(s);
         return 0;
     }
+    LOG("peer/server: unsupported first frame type=%u", (unsigned)h.type);
     free(pl); closesock(pfd); return 0;
 }
 
@@ -2126,7 +2327,7 @@ static void* dispatch(void* arg) {
     sock_t fd = (sock_t)(intptr_t)arg;
     char c; int r = recv(fd, &c, 1, MSG_PEEK);
     if (r <= 0) { closesock(fd); return 0; }
-    if ((unsigned char)c >= MSG_OPEN && (unsigned char)c <= MSG_PONG)
+    if (is_peer_msg_type((uint8_t)c))
         handle_peer((void*)(intptr_t)fd);
     else
         handle_client((void*)(intptr_t)fd);
@@ -2154,6 +2355,7 @@ static void print_help(const char* prog) {
         "  -pc SECONDS          Peer connect timeout (default: 10s)\n"
         "  -pio SECONDS         Peer I/O and heartbeat timeout (default: 20s)\n"
         "  -hi SECONDS          Peer heartbeat interval, minimum 1s (default: 5s)\n"
+        "  -k PASSWORD          Encrypt A<->B peer payloads with AES-CTR\n"
         "\n"
         "  -h, --help           Show this help message\n"
         "\n"
@@ -2193,6 +2395,7 @@ static void print_help(const char* prog) {
         "FEATURES:\n"
         "  Automatic reconnection with in-memory buffering\n"
         "  Supports HTTP keep-alive and request pipelining\n"
+        "  Optional AES-CTR encryption for relay-to-relay payloads\n"
         "  IPv4 and IPv6 dual-stack support\n"
         "  Cross-platform: Linux (gcc) and Windows (MinGW/MSVC)\n"
         "  Only Host header is rewritten; other headers forwarded as-is\n"
@@ -2205,8 +2408,8 @@ static void print_help(const char* prog) {
         "  Data is buffered in RAM; if buffer fills or reconnect times out, connections close\n"
         "\n"
         "SECURITY NOTE:\n"
-        "  This relay performs NO authentication. Use only on trusted networks or\n"
-        "  add your own allow-list / token check in the code.\n"
+        "  Use -k with the same password on both relays to encrypt peer payloads.\n"
+        "  Without -k, relay-to-relay payloads are sent in plaintext.\n"
         "\n",
         prog, prog, prog, prog, prog, prog
     );
@@ -2249,6 +2452,8 @@ int main(int argc, char** argv) {
             g_peer_io_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-hi") && i + 1 < argc)
             g_heartbeat_interval = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-k") && i + 1 < argc)
+            crypto_set_password(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_help(argv[0]);
             return 0;
@@ -2257,7 +2462,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Usage: %s [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]\n"
                 "          [-cc client_connect_timeout] [-cio client_io_timeout]\n"
                 "          [-pc peer_connect_timeout] [-pio peer_io_timeout]\n"
-                "          [-hi heartbeat_interval]\n", argv[0]);
+                "          [-hi heartbeat_interval] [-k password]\n", argv[0]);
             return 1;
         }
     }
@@ -2274,6 +2479,7 @@ int main(int argc, char** argv) {
     LOG("client timeout: connect=%ds, io=%ds", g_client_connect_timeout, g_client_io_timeout);
     LOG("peer timeout: connect=%ds, io=%ds", g_peer_connect_timeout, g_peer_io_timeout);
     LOG("peer heartbeat: interval=%ds, timeout follows peer io timeout", g_heartbeat_interval);
+    LOG("peer encryption: %s", g_crypto_enabled ? "AES-CTR enabled" : "disabled");
 
     for (;;) {
         sock_t fd = accept(lfd, NULL, NULL);
@@ -2296,3 +2502,4 @@ int main(int argc, char** argv) {
 #endif
     return 0;
 }
+
