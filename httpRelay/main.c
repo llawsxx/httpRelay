@@ -1797,6 +1797,22 @@ static uint64_t gen_sid(void) {
     return v;
 }
 
+static void normalize_timeouts(void) {
+    if (g_peer_io_timeout < 0) g_peer_io_timeout = 0;
+
+    if (g_heartbeat_interval < 1) {
+        LOG("adjust heartbeat interval from %ds to minimum 1s", g_heartbeat_interval);
+        g_heartbeat_interval = 1;
+    }
+
+    int min_peer_io = g_heartbeat_interval * 3;
+    if (g_peer_io_timeout < min_peer_io) {
+        LOG("adjust peer io timeout from %ds to %ds (heartbeat interval %ds x 3)",
+            g_peer_io_timeout, min_peer_io, g_heartbeat_interval);
+        g_peer_io_timeout = min_peer_io;
+    }
+}
+
 
 static sock_t peer_connect_and_hs(sess_t* s, int resume) {
     sock_t fd = connect_peer(s->ph, s->pp); if (fd == BADSOCK) return BADSOCK;
@@ -2100,7 +2116,7 @@ static void print_help(const char* prog) {
         "  Peer-side timeout (relay <-> relay):\n"
         "  -pc SECONDS          Peer connect timeout (default: 10s)\n"
         "  -pio SECONDS         Peer I/O and heartbeat timeout (default: 20s)\n"
-        "  -hi SECONDS          Peer heartbeat interval, 0 disables heartbeat (default: 5s)\n"
+        "  -hi SECONDS          Peer heartbeat interval, minimum 1s (default: 5s)\n"
         "\n"
         "  -h, --help           Show this help message\n"
         "\n"
@@ -2208,6 +2224,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    normalize_timeouts();
 
     sock_t lfd = listen_on(g_port);
     if (lfd == BADSOCK) {
