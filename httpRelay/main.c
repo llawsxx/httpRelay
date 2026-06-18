@@ -180,6 +180,7 @@ static int    g_client_connect_timeout = 10;    /* 客户端连接目标超时 (
 static int    g_client_io_timeout = 120;         /* 客户端 I/O 超时 (秒) */
 static int    g_peer_connect_timeout = 10;      /* Peer 间连接超时 (秒) */
 static int    g_peer_io_timeout = 20;           /* Peer 间 I/O 超时 (秒) */
+static int    g_heartbeat_interval = 5;         /* Peer 心跳发送间隔 (秒) */
 #define IO_CHUNK 32768
 #define APP_POLL_INTERVAL_SEC 2
 
@@ -413,6 +414,11 @@ typedef struct {
     mutex_t   ref_lk;       /* 保护 refcnt（也可用原子操作替代）*/
     int       refcnt;       /* 引用计数 */
 
+    /* ---- peer 心跳 ---- */
+    mutex_t   hb_lk;          /* 保护 peer 活动时间和连接代次 */
+    int64_t   peer_last_rx;   /* 最近一次收到 peer 帧的时间(ms) */
+    uint64_t  peer_gen;       /* peer_fd 每次安装/断开递增, 避免旧线程误操作新连接 */
+
     char my_host[256];         /* A side host (where client connects) */
     char my_port[32];          /* A side port */
     char target_host[256];
@@ -430,6 +436,126 @@ typedef struct {
 }sess_t;
 
 static void* sender_thread(void* arg);
+static void session_addref(sess_t* s);
+static void session_release(sess_t* s);
+
+typedef struct {
+    sess_t* s;
+    uint64_t gen;
+} heartbeat_arg_t;
+
+static void peer_touch_rx(sess_t* s) {
+    mutex_lock(&s->hb_lk);
+    s->peer_last_rx = now_ms();
+    mutex_unlock(&s->hb_lk);
+}
+
+static int peer_gen_matches(sess_t* s, uint64_t gen) {
+    mutex_lock(&s->hb_lk);
+    int ok = (s->peer_gen == gen);
+    mutex_unlock(&s->hb_lk);
+    return ok;
+}
+
+static uint64_t peer_next_gen(sess_t* s) {
+    mutex_lock(&s->hb_lk);
+    s->peer_gen++;
+    s->peer_last_rx = now_ms();
+    uint64_t gen = s->peer_gen;
+    mutex_unlock(&s->hb_lk);
+    return gen;
+}
+
+static void* heartbeat_thread(void* arg) {
+    heartbeat_arg_t* ha = (heartbeat_arg_t*)arg;
+    sess_t* s = ha->s;
+    uint64_t gen = ha->gen;
+    free(ha);
+
+    for (;;) {
+        if (s->closing || g_heartbeat_interval <= 0 || g_peer_io_timeout <= 0) break;
+        sleep_ms(g_heartbeat_interval * 1000);
+        if (s->closing || !peer_gen_matches(s, gen)) break;
+
+        int64_t last_rx;
+        mutex_lock(&s->hb_lk);
+        last_rx = s->peer_last_rx;
+        mutex_unlock(&s->hb_lk);
+
+        int64_t idle_ms = now_ms() - last_rx;
+        if (idle_ms >= (int64_t)g_peer_io_timeout * 1000) {
+            mutex_lock(&s->peer_lk);
+            if (!s->closing && s->peer_fd != BADSOCK && peer_gen_matches(s, gen)) {
+                LOG("peer heartbeat timeout sid=%llu", (unsigned long long)s->sid);
+                closesock(s->peer_fd);
+                s->peer_fd = BADSOCK;
+                peer_next_gen(s);
+                if (!s->down_since) s->down_since = now_ms();
+            }
+            mutex_unlock(&s->peer_lk);
+            break;
+        }
+
+        if (idle_ms < (int64_t)g_heartbeat_interval * 1000) {
+            continue;
+        }
+
+        mutex_lock(&s->peer_lk);
+        if (s->closing || s->peer_fd == BADSOCK || !peer_gen_matches(s, gen)) {
+            mutex_unlock(&s->peer_lk);
+            break;
+        }
+        LOG("peer send heartbeat sid=%llu", (unsigned long long)s->sid);
+        if (send_frame(s->peer_fd, MSG_PING, (uint64_t)now_ms(), 0, 0) < 0) {
+            if (s->peer_fd != BADSOCK && peer_gen_matches(s, gen)) {
+                LOG("peer heartbeat send failed sid=%llu", (unsigned long long)s->sid);
+                closesock(s->peer_fd);
+                s->peer_fd = BADSOCK;
+                peer_next_gen(s);
+                if (!s->down_since) s->down_since = now_ms();
+            }
+            mutex_unlock(&s->peer_lk);
+            break;
+        }
+        mutex_unlock(&s->peer_lk);
+    }
+
+    session_release(s);
+    return NULL;
+}
+
+static void start_heartbeat_for_gen(sess_t* s, uint64_t gen) {
+    if (!s->is_initiator) return;
+    if (g_heartbeat_interval <= 0 || g_peer_io_timeout <= 0) return;
+    heartbeat_arg_t* ha = (heartbeat_arg_t*)malloc(sizeof(*ha));
+    if (!ha) return;
+    ha->s = s;
+    ha->gen = gen;
+    session_addref(s);
+    thread_t t;
+    if (thread_create(&t, heartbeat_thread, ha) == 0) {
+        thread_detach(t);
+    }
+    else {
+        session_release(s);
+        free(ha);
+    }
+}
+
+static void peer_install_locked(sess_t* s, sock_t fd) {
+    s->peer_fd = fd;
+    uint64_t gen = peer_next_gen(s);
+    start_heartbeat_for_gen(s, gen);
+}
+
+static void peer_close_locked(sess_t* s) {
+    if (s->peer_fd != BADSOCK) {
+        closesock(s->peer_fd);
+        s->peer_fd = BADSOCK;
+        peer_next_gen(s);
+    }
+    if (!s->down_since) s->down_since = now_ms();
+}
 
 static void session_init(sess_t* s) {
     swi(&s->out);
@@ -438,6 +564,7 @@ static void session_init(sess_t* s) {
     mutex_init(&s->send_lk);
     mutex_init(&s->term_lk);
     mutex_init(&s->act_lk); 
+    mutex_init(&s->hb_lk);
     cond_init(&s->send_cv);
     s->send_dirty = 0;
     s->refcnt = 1;                 /* owner持有的引用 */
@@ -452,6 +579,8 @@ static void session_init(sess_t* s) {
     s->resp_header_complete = 0;
     s->last_activity = now_ms();
     s->app_io_timeout = 0;
+    s->peer_last_rx = now_ms();
+    s->peer_gen = 0;
 }
 
 
@@ -475,6 +604,7 @@ static void session_uninit(sess_t* s) {
     mutex_destroy(&s->send_lk);
     mutex_destroy(&s->term_lk);
     mutex_destroy(&s->act_lk);
+    mutex_destroy(&s->hb_lk);
     cond_destroy(&s->send_cv);
     if (s->open_pl) {
         free(s->open_pl);
@@ -644,8 +774,7 @@ static void* sender_thread(void* arg) {
         mutex_lock(&s->peer_lk);
         if (s->peer_fd != BADSOCK) {
             if (sw_flush_locked_peer(s) < 0) {
-                closesock(s->peer_fd); s->peer_fd = BADSOCK;
-                if (!s->down_since)s->down_since = now_ms();
+                peer_close_locked(s);
             }
         }
         mutex_unlock(&s->peer_lk);
@@ -1406,7 +1535,10 @@ static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
     case MSG_CLOSE: free(pl); session_terminate(s); return 0;
     case MSG_PING:
         mutex_lock(&s->peer_lk);
-        if (s->peer_fd != BADSOCK) send_frame(s->peer_fd, MSG_PONG, h->value, 0, 0);
+        if (s->peer_fd != BADSOCK && send_frame(s->peer_fd, MSG_PONG, h->value, 0, 0) < 0) {
+            LOG("peer pong send failed sid=%llu", (unsigned long long)s->sid);
+            peer_close_locked(s);
+        }
         mutex_unlock(&s->peer_lk); free(pl); return 1;
     case MSG_PONG: free(pl); return 1;
     default: free(pl); return 1;
@@ -1418,6 +1550,7 @@ static int peer_recv_loop(sess_t* s) {
     for (;;) {
         struct fhdr h; char* pl = NULL; int r = recv_frame(s->peer_fd, &h, &pl);
         if (r <= 0) { free(pl); return -1; }
+        peer_touch_rx(s);
         int rc = handle_frame(s, &h, pl);
         if (rc == 0 || s->closing) return 0;
     }
@@ -1690,7 +1823,7 @@ static sock_t peer_connect_and_hs(sess_t* s, int resume) {
         mutex_lock(&s->out.lk);
         s->out.sent = (peer_recv > s->out.base) ? peer_recv : s->out.base;
         mutex_unlock(&s->out.lk);
-        s->peer_fd = fd;                    /* 装上连接, 此刻 sent 已正确 */
+        peer_install_locked(s, fd);         /* 装上连接, 此刻 sent 已正确 */
         mutex_unlock(&s->peer_lk);
         notify_send(s);                     /* 叫发送线程从正确的 sent 重发 */
         return fd;
@@ -1720,7 +1853,7 @@ static void* a_peer_thread(void* arg) {
                 /* open 分支: 这里负责装 peer_fd (sent 已在函数内重置为 base) */
                 mutex_lock(&s->peer_lk);
                 if (s->closing) { mutex_unlock(&s->peer_lk); closesock(fd); break; }
-                s->peer_fd = fd;
+                peer_install_locked(s, fd);
                 mutex_unlock(&s->peer_lk);
                 s->down_since = 0;
                 s->opened = 1;
@@ -1732,9 +1865,8 @@ static void* a_peer_thread(void* arg) {
         if (s->closing) break;
         if (r == 0) { session_terminate(s); break; }
         mutex_lock(&s->peer_lk);
-        if (s->peer_fd != BADSOCK) { closesock(s->peer_fd); s->peer_fd = BADSOCK; }
+        peer_close_locked(s);
         mutex_unlock(&s->peer_lk);
-        if (!s->down_since)s->down_since = now_ms();
         LOG("peer link down, will reconnect sid=%llu", (unsigned long long)s->sid);
     }
     return NULL;
@@ -1866,9 +1998,12 @@ static void* handle_peer(void* arg) {
         set_send_timeout(tfd, APP_POLL_INTERVAL_SEC);
         sess_touch_activity(s);
 
-        s->app_fd = tfd; s->peer_fd = pfd; s->is_initiator = 0; s->sid = h.value;
+        s->app_fd = tfd; s->peer_fd = BADSOCK; s->is_initiator = 0; s->sid = h.value;
         LOG("passive session sid=%llu target %s:%s", (unsigned long long)s->sid, th, tp);
         b_register(s);
+        mutex_lock(&s->peer_lk);
+        peer_install_locked(s, pfd);
+        mutex_unlock(&s->peer_lk);
         session_start_sender(s);
 
         thread_t th2; thread_create(&th2, t_app2peer, s);
@@ -1886,9 +2021,8 @@ static void* handle_peer(void* arg) {
             if (s->closing) break;
             if (rr == 0) break;
             mutex_lock(&s->peer_lk);
-            if (s->peer_fd != BADSOCK) { closesock(s->peer_fd); s->peer_fd = BADSOCK; }
+            peer_close_locked(s);
             mutex_unlock(&s->peer_lk);
-            if (!s->down_since)s->down_since = now_ms();
             LOG("B side peer link down, waiting for reconnect sid=%llu", (unsigned long long)s->sid);
         }
         session_terminate(s);
@@ -1919,7 +2053,8 @@ static void* handle_peer(void* arg) {
         mutex_lock(&s->out.lk);
         s->out.sent = (peer_recv > s->out.base) ? peer_recv : s->out.base;
         mutex_unlock(&s->out.lk);
-        sock_t old = s->peer_fd; s->peer_fd = pfd;
+        sock_t old = s->peer_fd;
+        peer_install_locked(s, pfd);
         mutex_unlock(&s->peer_lk);
         if (old != BADSOCK) closesock(old);
         s->down_since = 0;
@@ -1960,11 +2095,12 @@ static void print_help(const char* prog) {
         "\n"
         "  Client-side timeout (HTTP client <-> relay, relay <-> target):\n"
         "  -cc SECONDS          Client connect timeout (default: 10s)\n"
-        "  -cio SECONDS         Client I/O timeout (default: 30s)\n"
+        "  -cio SECONDS         Client I/O timeout (default: 120s)\n"
         "\n"
         "  Peer-side timeout (relay <-> relay):\n"
-        "  -pc SECONDS          Peer connect timeout (default: 30s)\n"
-        "  -pio SECONDS         Peer I/O timeout (default: 60s)\n"
+        "  -pc SECONDS          Peer connect timeout (default: 10s)\n"
+        "  -pio SECONDS         Peer I/O and heartbeat timeout (default: 20s)\n"
+        "  -hi SECONDS          Peer heartbeat interval, 0 disables heartbeat (default: 5s)\n"
         "\n"
         "  -h, --help           Show this help message\n"
         "\n"
@@ -2058,6 +2194,8 @@ int main(int argc, char** argv) {
             g_peer_connect_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-pio") && i + 1 < argc)
             g_peer_io_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-hi") && i + 1 < argc)
+            g_heartbeat_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_help(argv[0]);
             return 0;
@@ -2065,7 +2203,8 @@ int main(int argc, char** argv) {
         else {
             fprintf(stderr, "Usage: %s [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]\n"
                 "          [-cc client_connect_timeout] [-cio client_io_timeout]\n"
-                "          [-pc peer_connect_timeout] [-pio peer_io_timeout]\n", argv[0]);
+                "          [-pc peer_connect_timeout] [-pio peer_io_timeout]\n"
+                "          [-hi heartbeat_interval]\n", argv[0]);
             return 1;
         }
     }
@@ -2079,6 +2218,7 @@ int main(int argc, char** argv) {
         g_port, g_max_buffer, g_reconnect_timeout);
     LOG("client timeout: connect=%ds, io=%ds", g_client_connect_timeout, g_client_io_timeout);
     LOG("peer timeout: connect=%ds, io=%ds", g_peer_connect_timeout, g_peer_io_timeout);
+    LOG("peer heartbeat: interval=%ds, timeout follows peer io timeout", g_heartbeat_interval);
 
     for (;;) {
         sock_t fd = accept(lfd, NULL, NULL);
