@@ -625,6 +625,7 @@ typedef struct {
     mutex_t recv_lk;
     volatile int closing;     /* session terminating */
     volatile int terminated;  // 是否已完成终止
+    volatile int peer_close_requested; /* sender must flush DATA before MSG_CLOSE */
     volatile int peer_close_sent; /* MSG_CLOSE sent; keep peer read side open for peer EOF */
     mutex_t term_lk;          // 终止专用锁
     int64_t down_since;       /* time (ms) the peer link went down, 0 if up */
@@ -669,14 +670,12 @@ static void* sender_thread(void* arg);
 static void session_addref(sess_t* s);
 static void session_release(sess_t* s);
 
-static int session_send_close(sess_t* s) {
-    if (s->peer_fd == BADSOCK) return -1;
-    int rc = send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
-    if (rc == 0) {
-        s->peer_close_sent = 1;
-        shutdown(s->peer_fd, SHUT_WR);
-    }
-    return rc;
+static void session_request_peer_close(sess_t* s) {
+    mutex_lock(&s->send_lk);
+    s->peer_close_requested = 1;
+    s->send_dirty = 1;
+    cond_signal(&s->send_cv);
+    mutex_unlock(&s->send_lk);
 }
 
 typedef struct {
@@ -886,14 +885,14 @@ static void session_terminate(sess_t* s) {
     s->closing = 1;
     mutex_unlock(&s->term_lk);
 
-    LOG("session terminate sid=%llu", (unsigned long long)s->sid);
+    LOG("%c session terminate sid=%llu", s->is_initiator ? 'A': 'B', (unsigned long long)s->sid);
 
     /* app 侧: 双向关闭唤醒 t_app2peer 的 recv 和 handle_frame 的 wfull */
     if (s->app_fd != BADSOCK) shutdown(s->app_fd, SHUT_RDWR);
 
     /* peer 侧: 唤醒 peer_recv_loop 的 recv */
     mutex_lock(&s->peer_lk);
-    if (s->peer_fd != BADSOCK && !s->peer_close_sent) shutdown(s->peer_fd, SHUT_RDWR);
+    if (s->peer_fd != BADSOCK && !s->peer_close_requested && !s->peer_close_sent) shutdown(s->peer_fd, SHUT_RDWR);
     mutex_unlock(&s->peer_lk);
 
     /* 唤醒发送线程 */
@@ -920,7 +919,7 @@ static void session_release(sess_t* s) {
         if (s->peer_fd != BADSOCK) closesock(s->peer_fd);
         session_uninit(s);          /* 销毁 recv_lk/peer_lk/send_lk/send_cv/out 等 */
         mutex_destroy(&s->ref_lk);
-        LOG("session_release ok sid=%llu", s->sid);
+        LOG("%c session_release ok sid=%llu",s->is_initiator ? 'A' : 'B', s->sid);
         free(s);
     }
 }
@@ -1000,14 +999,15 @@ static void* sender_thread(void* arg) {
     for (;;) {
         /* 等待有数据或被唤醒 */
         mutex_lock(&s->send_lk);
-        while (!s->send_dirty && !s->closing) {
+        while (!s->send_dirty && !s->closing && !s->peer_close_requested) {
             cond_wait_ms(&s->send_cv, &s->send_lk, 1000);   /* 1s 超时以便周期性检查 closing */
         }
         int closing = s->closing;
+        int close_requested = s->peer_close_requested;
         s->send_dirty = 0;          /* 清标记 (在锁内清, 避免丢唤醒) */
         mutex_unlock(&s->send_lk);
 
-        if (closing) break;
+        if (closing && !close_requested) break;
 
         /* 执行 flush。peer_fd 可能为 BADSOCK(断开中)，那就什么都不发，
            等重连后 a_peer_thread/resume 会重置 sent 并 notify。 */
@@ -1016,8 +1016,19 @@ static void* sender_thread(void* arg) {
             if (sw_flush_locked_peer(s) < 0) {
                 peer_close_locked(s);
             }
+            else if (close_requested && !s->peer_close_sent) {
+                if (send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0) == 0) {
+                    s->peer_close_sent = 1;
+                    shutdown(s->peer_fd, SHUT_WR);
+                }
+                else {
+                    peer_close_locked(s);
+                }
+            }
         }
         mutex_unlock(&s->peer_lk);
+
+        if (close_requested) break;
     }
     return NULL;
 }
@@ -1589,9 +1600,7 @@ static int rewrite_location(
          break;                                   /* 真错误 */
      }
      free(c);
-     mutex_lock(&s->peer_lk);
-     if (s->peer_fd != BADSOCK) session_send_close(s);
-     mutex_unlock(&s->peer_lk);
+     session_request_peer_close(s);
      session_terminate(s);
      return NULL;
  }
@@ -1772,7 +1781,9 @@ static int handle_frame(sess_t* s, struct fhdr* h, char* pl) {
     }
     case MSG_ACK: 
         sw_drop_to(&s->out, h->value); free(pl); return 1;
-    case MSG_CLOSE: free(pl); session_terminate(s); return 0;
+    case MSG_CLOSE:
+        free(pl); session_terminate(s);
+        return 0;
     case MSG_AUTH_FAIL:
         LOG("peer authentication rejected sid=%llu", (unsigned long long)s->sid);
         free(pl);
@@ -2213,9 +2224,7 @@ static void* handle_client(void* arg) {
     while (!s->closing) {
         char* h2; size_t he2;
         if (hin_read_headers(&in, &h2, &he2) < 0) {
-            mutex_lock(&s->peer_lk);
-            if (s->peer_fd != BADSOCK) session_send_close(s);
-            mutex_unlock(&s->peer_lk);
+            session_request_peer_close(s);
             break;
         }
         char ph2[256], pp2[32], th2[256], tp2[32]; char* rw2 = NULL; uint32_t rl2 = 0;
