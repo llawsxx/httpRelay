@@ -61,6 +61,9 @@ typedef SOCKET sock_t;
 #ifndef SHUT_RDWR
 #define SHUT_RDWR SD_BOTH
 #endif
+#ifndef SHUT_WR
+#define SHUT_WR SD_SEND
+#endif
 #define sockerrno WSAGetLastError()
 #define SOCK_EINTR  WSAEINTR
 #ifndef MSG_NOSIGNAL
@@ -393,6 +396,27 @@ static int send_frame(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t
     return rc;
 }
 
+static int wait_peer_close(sock_t fd) {
+    char buf[512];
+    for (;;) {
+        int r = recv(fd, buf, sizeof buf, 0);
+        if (r == 0) return 0;
+        if (r > 0) continue;
+        if (sock_is_eintr()) continue;
+        if (sock_is_timeout()) return 0;
+        return -1;
+    }
+}
+
+static int send_close_and_wait_peer(sock_t fd, uint64_t sid) {
+    int rc = send_frame(fd, MSG_CLOSE, sid, 0, 0);
+    if (rc == 0) {
+        shutdown(fd, SHUT_WR);
+        wait_peer_close(fd);
+    }
+    return rc;
+}
+
 static int recv_frame(sock_t fd, struct fhdr* h, char** pl) {
     int r = recv_frame_raw(fd, h, pl); if (r <= 0) return r;
     if (g_crypto_enabled) {
@@ -601,6 +625,7 @@ typedef struct {
     mutex_t recv_lk;
     volatile int closing;     /* session terminating */
     volatile int terminated;  // 是否已完成终止
+    volatile int peer_close_sent; /* MSG_CLOSE sent; keep peer read side open for peer EOF */
     mutex_t term_lk;          // 终止专用锁
     int64_t down_since;       /* time (ms) the peer link went down, 0 if up */
     int is_initiator;         /* 1 = A side */
@@ -643,6 +668,16 @@ typedef struct {
 static void* sender_thread(void* arg);
 static void session_addref(sess_t* s);
 static void session_release(sess_t* s);
+
+static int session_send_close(sess_t* s) {
+    if (s->peer_fd == BADSOCK) return -1;
+    int rc = send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
+    if (rc == 0) {
+        s->peer_close_sent = 1;
+        shutdown(s->peer_fd, SHUT_WR);
+    }
+    return rc;
+}
 
 typedef struct {
     sess_t* s;
@@ -858,7 +893,7 @@ static void session_terminate(sess_t* s) {
 
     /* peer 侧: 唤醒 peer_recv_loop 的 recv */
     mutex_lock(&s->peer_lk);
-    if (s->peer_fd != BADSOCK) shutdown(s->peer_fd, SHUT_RDWR);
+    if (s->peer_fd != BADSOCK && !s->peer_close_sent) shutdown(s->peer_fd, SHUT_RDWR);
     mutex_unlock(&s->peer_lk);
 
     /* 唤醒发送线程 */
@@ -1555,7 +1590,7 @@ static int rewrite_location(
      }
      free(c);
      mutex_lock(&s->peer_lk);
-     if (s->peer_fd != BADSOCK) send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
+     if (s->peer_fd != BADSOCK) session_send_close(s);
      mutex_unlock(&s->peer_lk);
      session_terminate(s);
      return NULL;
@@ -2178,7 +2213,9 @@ static void* handle_client(void* arg) {
     while (!s->closing) {
         char* h2; size_t he2;
         if (hin_read_headers(&in, &h2, &he2) < 0) {
-            send_frame(s->peer_fd, MSG_CLOSE, s->sid, 0, 0);
+            mutex_lock(&s->peer_lk);
+            if (s->peer_fd != BADSOCK) session_send_close(s);
+            mutex_unlock(&s->peer_lk);
             break;
         }
         char ph2[256], pp2[32], th2[256], tp2[32]; char* rw2 = NULL; uint32_t rl2 = 0;
@@ -2235,7 +2272,7 @@ static void* handle_peer(void* arg) {
         sock_t tfd = connect_with_timeout(th, tp, g_client_connect_timeout);
         if (tfd == BADSOCK) {
             LOG("connect to target %s:%s failed", th, tp); free(pl);
-            send_frame(pfd, MSG_CLOSE, h.value, 0, 0); closesock(pfd); return 0;
+            send_close_and_wait_peer(pfd, h.value); closesock(pfd); return 0;
         }
         nodelay_on(tfd);
 
@@ -2292,7 +2329,7 @@ static void* handle_peer(void* arg) {
         sess_t* s = b_find(sid);
         if (!s) {
             LOG("RESUME: session not found sid=%llu", (unsigned long long)sid);
-            send_frame(pfd, MSG_CLOSE, sid, 0, 0); closesock(pfd); return 0;
+            send_close_and_wait_peer(pfd, sid); closesock(pfd); return 0;
         }
         mutex_lock(&s->recv_lk); uint64_t myrecv = s->recv_off; mutex_unlock(&s->recv_lk);
         uint64_t be = sw64(myrecv);
@@ -2502,4 +2539,3 @@ int main(int argc, char** argv) {
 #endif
     return 0;
 }
-
