@@ -26,5 +26,23 @@
     <ClInclude Include="aes.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="http_in.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="log.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="platform.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="protocol.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="session.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="send_window.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

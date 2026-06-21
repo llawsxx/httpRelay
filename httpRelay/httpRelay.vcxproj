@@ -128,6 +128,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="aes.h" />
+    <ClInclude Include="http_in.h" />
+    <ClInclude Include="log.h" />
+    <ClInclude Include="platform.h" />
+    <ClInclude Include="protocol.h" />
+    <ClInclude Include="session.h" />
+    <ClInclude Include="send_window.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

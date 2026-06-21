@@ -3,13 +3,13 @@
  * httprelay.c -- Peer-to-peer HTTP relay with reconnect + in-memory resume buffering (cross-platform, IPv6).
  *
  * Build (Linux / gcc):
- *   gcc -O2 -o httprelay httprelay.c -lpthread
+ *   gcc -O2 -o httprelay main.c aes.c -lpthread
  *
  * Build (Windows / MinGW-w64):
- *   gcc -O2 -o httprelay.exe httprelay.c -lws2_32
+ *   gcc -O2 -o httprelay.exe main.c aes.c -lws2_32
  *
  * Build (Windows / MSVC):
- *   cl /O2 httprelay.c        (ws2_32 is linked automatically via pragma)
+ *   cl /O2 main.c aes.c        (ws2_32 is linked automatically via pragma)
  *
  * Run:
  *   httprelay [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]
@@ -42,136 +42,9 @@
  * networks or add your own allow-list / token check.
  */
 
- /* ============================================================
-  *  Platform abstraction layer
-  * ============================================================ */
-#ifdef _WIN32
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600   /* Vista+ : IPv6 / getaddrinfo */
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <process.h>
-#pragma comment(lib, "ws2_32.lib")
-
-typedef SOCKET sock_t;
-#define BADSOCK INVALID_SOCKET
-#define closesock closesocket
-#ifndef SHUT_RDWR
-#define SHUT_RDWR SD_BOTH
-#endif
-#ifndef SHUT_WR
-#define SHUT_WR SD_SEND
-#endif
-#define sockerrno WSAGetLastError()
-#define SOCK_EINTR  WSAEINTR
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
-
-typedef HANDLE thread_t;
-typedef CRITICAL_SECTION mutex_t;
-static int  mutex_init(mutex_t* m) { InitializeCriticalSection(m); return 0; }
-static void mutex_lock(mutex_t* m) { EnterCriticalSection(m); }
-static void mutex_unlock(mutex_t* m) { LeaveCriticalSection(m); }
-static void mutex_destroy(mutex_t* m) { DeleteCriticalSection(m); }
-
-typedef struct { void* (*fn)(void*); void* arg; } thr_wrap_t;
-static unsigned __stdcall thr_trampoline(void* p) {
-    thr_wrap_t* w = (thr_wrap_t*)p; void* (*fn)(void*) = w->fn; void* a = w->arg; free(w);
-    fn(a); return 0;
-}
-static int thread_create(thread_t* t, void* (*fn)(void*), void* arg) {
-    thr_wrap_t* w = (thr_wrap_t*)malloc(sizeof(*w)); if (!w)return -1; w->fn = fn; w->arg = arg;
-    uintptr_t h = _beginthreadex(NULL, 0, thr_trampoline, w, 0, NULL);
-    if (!h) { free(w); return -1; }
-    *t = (HANDLE)h; return 0;
-}
-static void thread_join(thread_t t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
-static void thread_detach(thread_t t) { CloseHandle(t); }
-static void sleep_ms(int ms) { Sleep(ms); }
-
-typedef CONDITION_VARIABLE cond_t;
-static int  cond_init(cond_t* c) { InitializeConditionVariable(c); return 0; }
-static void cond_destroy(cond_t* c) { (void)c; /* no-op on Windows */ }
-static void cond_signal(cond_t* c) { WakeConditionVariable(c); }
-static int  cond_wait_ms(cond_t* c, mutex_t* m, int ms) {
-    /* mutex_t 在 Windows 是 CRITICAL_SECTION */
-    BOOL ok = SleepConditionVariableCS(c, m, (DWORD)ms);
-    return ok ? 0 : 1;   /* 超时/失败返回非0 */
-}
-
-static void* memmem_compat(const void* h, size_t hl, const void* n, size_t nl) {
-    if (nl == 0) return (void*)h;
-    if (hl < nl) return NULL;
-    const unsigned char* hp = (const unsigned char*)h;
-    const unsigned char* np = (const unsigned char*)n;
-    for (size_t i = 0; i + nl <= hl; i++)
-        if (hp[i] == np[0] && memcmp(hp + i, np, nl) == 0) return (void*)(hp + i);
-    return NULL;
-}
-
-#define memmem memmem_compat
-
-#ifdef _MSC_VER
-#define strncasecmp _strnicmp
-#endif
-
-#else  /* ---------------- POSIX (Linux) ---------------- */
-#define _GNU_SOURCE
-#include <unistd.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <signal.h>
-#include <fcntl.h>
-
-typedef int sock_t;
-#define BADSOCK (-1)
-#define closesock close
-#define sockerrno errno
-#define SOCK_EINTR EINTR
-
-typedef pthread_t thread_t;
-typedef pthread_mutex_t mutex_t;
-static int  mutex_init(mutex_t* m) { return pthread_mutex_init(m, NULL); }
-static void mutex_lock(mutex_t* m) { pthread_mutex_lock(m); }
-static void mutex_unlock(mutex_t* m) { pthread_mutex_unlock(m); }
-static void mutex_destroy(mutex_t* m) { pthread_mutex_destroy(m); }
-static int  thread_create(thread_t* t, void* (*fn)(void*), void* arg) { return pthread_create(t, NULL, fn, arg); }
-static void thread_join(thread_t t) { pthread_join(t, NULL); }
-static void thread_detach(thread_t t) { pthread_detach(t); }
-static void sleep_ms(int ms) { usleep(ms * 1000); }
-
-typedef pthread_cond_t  cond_t;
-static int  cond_init(cond_t* c) { return pthread_cond_init(c, NULL); }
-static void cond_destroy(cond_t* c) { pthread_cond_destroy(c); }
-static void cond_signal(cond_t* c) { pthread_cond_signal(c); }
-/* 在持有 mutex 的情况下等待，带超时(毫秒)，超时返回非0 */
-static int  cond_wait_ms(cond_t* c, mutex_t* m, int ms) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += ms / 1000;
-    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    return pthread_cond_timedwait(c, m, &ts);
-}
-#endif
-
-/* ============================================================
- *  Common headers
- * ============================================================ */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <errno.h>
-#include <time.h>
+#include "platform.h"
 #include "aes.h"
+#include "log.h"
 
  /* ============================================================
   *  Configurable parameters
@@ -191,35 +64,9 @@ static uint32_t g_crypto_schedule[60];
 #define IO_CHUNK 32768
 #define APP_POLL_INTERVAL_SEC 2
 
-static int64_t now_ms(void) {
-#ifdef _WIN32
-    return (int64_t)GetTickCount64();
-#else
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-#endif
-}
-
-static void format_log_time(char* buf, size_t len) {
-#ifdef _WIN32
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u.%03u",
-        (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
-        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
-        (unsigned)(st.wMilliseconds));
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tmv;
-    localtime_r(&ts.tv_sec, &tmv);
-    snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
-        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-        tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000L);
-#endif
-}
-
-#define LOG(f,...) do{ char _log_ts[32]; format_log_time(_log_ts,sizeof(_log_ts)); fprintf(stderr,"[%s] " f "\n",_log_ts,##__VA_ARGS__); }while(0)
+#include "protocol.h"
+#include "session.h"
+#include "http_in.h"
 
 static uint64_t splitmix64_next(uint64_t* state);
 
@@ -275,26 +122,6 @@ static void crypto_auth_response(uint64_t challenge, uint8_t out[16]) {
     memset(iv, 0, sizeof iv);
     aes_encrypt_ctr(plain, sizeof plain, out, g_crypto_schedule, AES_KEY_SIZE, iv);
 }
-
-/* ============================================================
- *  A<->B frame protocol
- * ============================================================ */
-enum {
-    MSG_OPEN = 1, MSG_RESUME = 2, MSG_RESUME_ACK = 3, MSG_DATA = 4,
-    MSG_ACK = 5, MSG_CLOSE = 6, MSG_PING = 7, MSG_PONG = 8,
-    MSG_AUTH_REQ = 250, MSG_AUTH_OK = 251, MSG_AUTH_FAIL = 252
-};
-
-#pragma pack(push,1)
-struct fhdr { uint8_t type, r1; uint16_t r2; uint64_t value; uint32_t plen; };
-#pragma pack(pop)
-
-static uint64_t sw64(uint64_t v) {
-    uint64_t r; uint8_t* p = (uint8_t*)&r;
-    p[0] = (uint8_t)(v >> 56); p[1] = (uint8_t)(v >> 48); p[2] = (uint8_t)(v >> 40); p[3] = (uint8_t)(v >> 32);
-    p[4] = (uint8_t)(v >> 24); p[5] = (uint8_t)(v >> 16); p[6] = (uint8_t)(v >> 8); p[7] = (uint8_t)v; return r;
-}
-static uint32_t sw32(uint32_t v) { return((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >> 8) & 0xff00) | ((v >> 24) & 0xff); }
 
 /* 判断当前 sockerrno 是否为 "超时/可重试" (用于 SO_RCVTIMEO/SO_SNDTIMEO) */
 static int sock_is_timeout(void) {
@@ -512,160 +339,6 @@ static void wait_peer_close_after_auth_fail(sock_t fd) {
     }
 }
 
-/* ============================================================
- *  Send window (retransmit buffer)
- * ============================================================ */
-typedef struct {
-    mutex_t lk;
-    cond_t cv;
-    char* buf; size_t cap, len;
-    uint64_t base;    /* buf[0] 的绝对偏移 = acked */
-    uint64_t high;    /* 已产生数据的最高偏移 */
-    uint64_t acked;   /* 对端已确认偏移 */
-    uint64_t sent;    /* 已发送到当前 peer 连接的偏移 (重连时重置为 base 或 peer_recv) */
-}sw_t;
-static void swi(sw_t* s) {
-    mutex_init(&s->lk);
-    cond_init(&s->cv);
-    s->buf = NULL;
-    s->cap = s->len = 0;
-    s->base = s->high = s->acked = s->sent = 0;
-}
-static void swf(sw_t* s) {
-    free(s->buf);
-    cond_destroy(&s->cv);
-    mutex_destroy(&s->lk);
-}
-
-/*
- * Append data to send window. Block if buffer would exceed limit.
- *
- * Return:
- *   0      : success, *off = absolute offset of appended data
- *  -1      : session closing or error
- *  -2      : timeout (not used in this version, returns -1 on timeout)
- */
-static int sw_append(sw_t* s, const void* d, size_t n, size_t mx, uint64_t* off,
-    volatile int* closing) {
-    if (!d || n == 0) return 0;
-
-    mutex_lock(&s->lk);
-
-    /* Wait until there's space in buffer or closing signal */
-    while (s->len + n > mx && !*closing) {
-        LOG("sw_append: buffer full (%zu + %zu > %zu), waiting for ACK...",
-            s->len, n, mx);
-        int rc = cond_wait_ms(&s->cv, &s->lk, 1000);  /* 1s timeout per wait */
-        if (*closing) {
-            mutex_unlock(&s->lk);
-            return -1;
-        }
-        /* 即使超时也继续等待，除非 closing 被设置 */
-    }
-
-    if (*closing) {
-        mutex_unlock(&s->lk);
-        return -1;
-    }
-
-    /* Now we have space (or are closing) */
-    if (s->len + n > s->cap) {
-        size_t c = s->cap ? s->cap : 65536;
-        while (c < s->len + n) c *= 2;
-        char* nb = (char*)realloc(s->buf, c);
-        if (!nb) {
-            mutex_unlock(&s->lk);
-            return -1;
-        }
-        s->buf = nb;
-        s->cap = c;
-    }
-
-    *off = s->high;
-    memcpy(s->buf + s->len, d, n);
-    s->len += n;
-    s->high += n;
-
-    mutex_unlock(&s->lk);
-    return 0;
-}
-
-/*
- * Signal that data has been ACKed, wake up waiters in sw_append
- */
-static void sw_drop_to(sw_t* s, uint64_t off) {
-    mutex_lock(&s->lk);
-    if (off > s->base && off <= s->high) {
-        size_t d = (size_t)(off - s->base);
-        if (d <= s->len) {
-            memmove(s->buf, s->buf + d, s->len - d);
-            s->len -= d;
-        }
-        else {
-            s->len = 0;
-        }
-        s->base = off;
-        if (off > s->acked) s->acked = off;
-
-        /*  Wake up any threads blocked in sw_append */
-        cond_signal(&s->cv);
-    }
-    mutex_unlock(&s->lk);
-}
-
-/* ============================================================
- *  Session
- * ============================================================ */
-typedef struct {
-    sock_t app_fd;            /* application side: A=client, B=target */
-    sock_t peer_fd;           /* A<->B TCP, BADSOCK when down */
-    mutex_t peer_lk;
-    sw_t out;                 /* our -> peer send window */
-    uint64_t recv_off;        /* offset of data we have contiguously received from peer */
-    mutex_t recv_lk;
-    volatile int closing;     /* session terminating */
-    volatile int terminated;  // 是否已完成终止
-    volatile int peer_close_requested; /* sender must flush DATA before MSG_CLOSE */
-    volatile int peer_close_sent; /* MSG_CLOSE sent; keep peer read side open for peer EOF */
-    mutex_t term_lk;          // 终止专用锁
-    int64_t down_since;       /* time (ms) the peer link went down, 0 if up */
-    int is_initiator;         /* 1 = A side */
-    char ph[256], pp[32];      /* peer host/port (A side only) */
-    uint64_t sid;
-    char* open_pl; uint32_t open_len;   /* OPEN payload (A side only) */
-    volatile int opened;
-
-    /* ---- 发送线程相关 ---- */
-    mutex_t   send_lk;        /* 配合 send_cv 使用 */
-    cond_t    send_cv;        /* 有新数据可发 / 需要 flush 的信号 */
-    volatile int send_dirty;  /* 标记: 有待发送数据 (避免丢失唤醒) */
-    thread_t  send_thr;       /* 发送线程句柄 */
-    volatile int send_running;
-
-    mutex_t   ref_lk;       /* 保护 refcnt（也可用原子操作替代）*/
-    int       refcnt;       /* 引用计数 */
-
-    /* ---- peer 心跳 ---- */
-    mutex_t   hb_lk;          /* 保护 peer 活动时间和连接代次 */
-    int64_t   peer_last_rx;   /* 最近一次收到 peer 帧的时间(ms) */
-    uint64_t  peer_gen;       /* peer_fd 每次安装/断开递增, 避免旧线程误操作新连接 */
-
-    char my_host[256];         /* A side host (where client connects) */
-    char my_port[32];          /* A side port */
-    char target_host[256];
-    char target_port[32];
-
-    char* resp_header_buf;
-    size_t resp_header_cap;
-    size_t resp_header_len;
-    volatile int resp_header_complete;  /* 0=未完成, 1=已完成, -1=不需要重写 */
-
-    /* ---- 统一活动超时 (client 侧 app_fd) ---- */
-    mutex_t   act_lk;            /* 保护 last_activity */
-    int64_t   last_activity;     /* 最近一次 app_fd 上成功 I/O 的时间(ms) */
-    int       app_io_timeout;    /* 该会话 app 侧总超时(秒)，0=不启用 */
-}sess_t;
-
 static void* sender_thread(void* arg);
 static void session_addref(sess_t* s);
 static void session_release(sess_t* s);
@@ -677,11 +350,6 @@ static void session_request_peer_close(sess_t* s) {
     cond_signal(&s->send_cv);
     mutex_unlock(&s->send_lk);
 }
-
-typedef struct {
-    sess_t* s;
-    uint64_t gen;
-} heartbeat_arg_t;
 
 static void peer_touch_rx(sess_t* s) {
     mutex_lock(&s->hb_lk);
@@ -1855,15 +1523,6 @@ static sess_t* b_find(uint64_t sid) {
 /* ============================================================
  *  A side: streaming HTTP request reader (keep-alive aware)
  * ============================================================ */
-typedef struct {
-    sock_t fd;
-    char* buf;
-    size_t cap, len, off;
-    sess_t* sess; /* 关联会话, 用于活动超时(可为 NULL) */
-    int64_t start_ms;      /* 新增: 无 sess 时的起始时间戳 */
-    int     init_timeout;  /* 新增: 无 sess 时的首请求超时(秒), 0=不限 */
-} httpin_t;
-
 static void hin_init(httpin_t* h, sock_t fd) {
     h->fd = fd; h->cap = 8192; h->len = 0; h->off = 0; h->sess = NULL;
     h->start_ms = now_ms();
