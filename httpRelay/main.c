@@ -3,13 +3,13 @@
  * httprelay.c -- Peer-to-peer HTTP relay with reconnect + in-memory resume buffering (cross-platform, IPv6).
  *
  * Build (Linux / gcc):
- *   gcc -O2 -o httprelay main.c aes.c -lpthread
+ *   gcc -O2 -o httprelay main.c -lssl -lcrypto -lpthread
  *
  * Build (Windows / MinGW-w64):
- *   gcc -O2 -o httprelay.exe main.c aes.c -lws2_32
+ *   gcc -O2 -o httprelay.exe main.c -lssl -lcrypto -lws2_32
  *
  * Build (Windows / MSVC):
- *   cl /O2 main.c aes.c        (ws2_32 is linked automatically via pragma)
+ *   cl /O2 main.c /link libssl.lib libcrypto.lib ws2_32.lib
  *
  * Run:
  *   httprelay [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]
@@ -43,7 +43,10 @@
  */
 
 #include "platform.h"
-#include "aes.h"
+#include <limits.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
 #include "log.h"
 
  /* ============================================================
@@ -59,16 +62,53 @@ static int    g_peer_connect_timeout = 10;      /* Peer 间连接超时 (秒) */
 static int    g_peer_io_timeout = 20;           /* Peer 间 I/O 超时 (秒) */
 static int    g_heartbeat_interval = 5;         /* Peer 心跳发送间隔 (秒) */
 static int    g_crypto_enabled = 0;             /* A<->B payload AES-CTR encryption */
+static int    g_insecure_upstream_tls = 0;      /* skip B-side HTTPS target certificate verification */
 static uint8_t g_crypto_key[16];
-static uint32_t g_crypto_schedule[60];
+static char   g_cacert_path[1024] = "cacert.pem";
 #define IO_CHUNK 32768
 #define APP_POLL_INTERVAL_SEC 2
+#define CRYPTO_BLOCK_SIZE 16
 
 #include "protocol.h"
 #include "session.h"
 #include "http_in.h"
 
 static uint64_t splitmix64_next(uint64_t* state);
+
+static void init_cacert_path(const char* argv0) {
+    char exe[1024];
+    exe[0] = 0;
+
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+    if (n == 0 || n >= sizeof exe) exe[0] = 0;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) exe[n] = 0;
+    else exe[0] = 0;
+#endif
+
+    if (!exe[0] && argv0 && *argv0) {
+        snprintf(exe, sizeof exe, "%s", argv0);
+    }
+
+    char* slash = strrchr(exe, '/');
+#ifdef _WIN32
+    char* backslash = strrchr(exe, '\\');
+    if (!slash || (backslash && backslash > slash)) slash = backslash;
+#endif
+
+    if (slash) {
+        size_t dir_len = (size_t)(slash - exe + 1);
+        if (dir_len + strlen("cacert.pem") < sizeof g_cacert_path) {
+            memcpy(g_cacert_path, exe, dir_len);
+            strcpy(g_cacert_path + dir_len, "cacert.pem");
+            return;
+        }
+    }
+
+    strcpy(g_cacert_path, "cacert.pem");
+}
 
 static void put64be(uint8_t* p, uint64_t v) {
     for (int i = 7; i >= 0; i--) { p[i] = (uint8_t)v; v >>= 8; }
@@ -95,9 +135,28 @@ static uint64_t crypto_next_nonce(void) {
     return splitmix64_next(&g_crypto_nonce_state);
 }
 
-static void crypto_make_iv(uint64_t nonce, uint8_t iv[AES_BLOCK_SIZE]) {
-    memset(iv, 0, AES_BLOCK_SIZE);
+static void crypto_make_iv(uint64_t nonce, uint8_t iv[CRYPTO_BLOCK_SIZE]) {
+    memset(iv, 0, CRYPTO_BLOCK_SIZE);
     put64be(iv, nonce);
+}
+
+static int crypto_aes128_ctr(const uint8_t* in, size_t in_len, uint8_t* out, const uint8_t iv[CRYPTO_BLOCK_SIZE]) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), NULL, g_crypto_key, iv);
+    int out_len = 0;
+    int total = 0;
+    if (ok == 1 && in_len > 0) {
+        if (in_len > (size_t)INT_MAX) ok = 0;
+        else if (EVP_EncryptUpdate(ctx, out, &out_len, in, (int)in_len) != 1) ok = 0;
+        else total = out_len;
+    }
+    if (ok == 1) {
+        if (EVP_EncryptFinal_ex(ctx, out + total, &out_len) != 1) ok = 0;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    return ok == 1 ? 0 : -1;
 }
 
 static void crypto_set_password(const char* password) {
@@ -109,18 +168,17 @@ static void crypto_set_password(const char* password) {
     }
     put64be(g_crypto_key, splitmix64_next(&st));
     put64be(g_crypto_key + 8, splitmix64_next(&st));
-    aes_key_setup(g_crypto_key, g_crypto_schedule, AES_KEY_SIZE);
     g_crypto_enabled = 1;
 }
 
 static const uint64_t CRYPTO_MAGIC = 0x4854524c41594531ULL; /* HTRLAYE1 */
 
 static void crypto_auth_response(uint64_t challenge, uint8_t out[16]) {
-    uint8_t plain[16], iv[AES_BLOCK_SIZE];
+    uint8_t plain[16], iv[CRYPTO_BLOCK_SIZE];
     put64be(plain, 0x4854524c41555448ULL); /* HTRLAUTH */
     put64be(plain + 8, challenge);
     memset(iv, 0, sizeof iv);
-    aes_encrypt_ctr(plain, sizeof plain, out, g_crypto_schedule, AES_KEY_SIZE, iv);
+    if (crypto_aes128_ctr(plain, sizeof plain, out, iv) < 0) memset(out, 0, 16);
 }
 
 /* 判断当前 sockerrno 是否为 "超时/可重试" (用于 SO_RCVTIMEO/SO_SNDTIMEO) */
@@ -211,10 +269,12 @@ static int send_frame(sock_t fd, uint8_t t, uint64_t v, const void* pl, uint32_t
         put64be((uint8_t*)enc, nonce);
         put64be((uint8_t*)enc + 8, CRYPTO_MAGIC);
         if (pn && pl) memcpy(enc + 16, pl, pn);
-        uint8_t iv[AES_BLOCK_SIZE];
+        uint8_t iv[CRYPTO_BLOCK_SIZE];
         crypto_make_iv(nonce, iv);
-        aes_encrypt_ctr((const uint8_t*)enc + 8, pn + 8, (uint8_t*)enc + 8,
-            g_crypto_schedule, AES_KEY_SIZE, iv);
+        if (crypto_aes128_ctr((const uint8_t*)enc + 8, pn + 8, (uint8_t*)enc + 8, iv) < 0) {
+            free(enc);
+            return -1;
+        }
         wire_pl = enc;
     }
 
@@ -250,10 +310,11 @@ static int recv_frame(sock_t fd, struct fhdr* h, char** pl) {
         if (h->plen < 16 || !*pl) { free(*pl); *pl = NULL; return -1; }
         uint64_t nonce = get64be((const uint8_t*)*pl);
         uint32_t plain_len = h->plen - 16;
-        uint8_t iv[AES_BLOCK_SIZE];
+        uint8_t iv[CRYPTO_BLOCK_SIZE];
         crypto_make_iv(nonce, iv);
-        aes_decrypt_ctr((const uint8_t*)*pl + 8, plain_len + 8, (uint8_t*)*pl + 8,
-            g_crypto_schedule, AES_KEY_SIZE, iv);
+        if (crypto_aes128_ctr((const uint8_t*)*pl + 8, plain_len + 8, (uint8_t*)*pl + 8, iv) < 0) {
+            free(*pl); *pl = NULL; return -1;
+        }
         if (get64be((const uint8_t*)*pl + 8) != CRYPTO_MAGIC) {
             LOG("encrypted peer frame authentication failed");
             free(*pl); *pl = NULL; return -1;
@@ -478,6 +539,10 @@ static void session_init(sess_t* s) {
     mutex_init(&s->ref_lk);
     s->target_host[0] = 0; 
     s->target_port[0] = 0;
+    s->target_tls = 0;
+    s->app_tls = 0;
+    s->app_ssl = NULL;
+    s->app_ssl_ctx = NULL;
     s->my_host[0] = 0;
     s->my_port[0] = 0;
     s->resp_header_buf = NULL;
@@ -542,6 +607,102 @@ static int sess_app_timed_out(sess_t* s) {
     return (now_ms() - la) >= (int64_t)s->app_io_timeout * 1000;
 }
 
+static int app_recv(sess_t* s, void* buf, size_t len) {
+    if (s->app_tls && s->app_ssl) return SSL_read((SSL*)s->app_ssl, buf, (int)len);
+    return recv(s->app_fd, buf, (int)len, 0);
+}
+
+static int app_send(sess_t* s, const void* buf, size_t len) {
+    if (s->app_tls && s->app_ssl) return SSL_write((SSL*)s->app_ssl, buf, (int)len);
+    return send(s->app_fd, buf, (int)len, MSG_NOSIGNAL);
+}
+
+static int app_io_should_retry(sess_t* s, int rc) {
+    if (s->app_tls && s->app_ssl) {
+        int err = SSL_get_error((SSL*)s->app_ssl, rc);
+        return err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
+    }
+    return sock_is_timeout();
+}
+
+static void app_shutdown(sess_t* s) {
+    if (s->app_tls && s->app_ssl) SSL_shutdown((SSL*)s->app_ssl);
+    if (s->app_fd != BADSOCK) shutdown(s->app_fd, SHUT_RDWR);
+}
+
+static void app_close(sess_t* s) {
+    if (s->app_ssl) {
+        SSL_free((SSL*)s->app_ssl);
+        s->app_ssl = NULL;
+    }
+    if (s->app_ssl_ctx) {
+        SSL_CTX_free((SSL_CTX*)s->app_ssl_ctx);
+        s->app_ssl_ctx = NULL;
+    }
+    if (s->app_fd != BADSOCK) closesock(s->app_fd);
+    s->app_fd = BADSOCK;
+}
+
+static int app_start_tls(sess_t* s, const char* server_name) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        LOG("upstream TLS: SSL_CTX_new failed");
+        return -1;
+    }
+
+    if (g_insecure_upstream_tls) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+    else {
+        if (SSL_CTX_load_verify_locations(ctx, g_cacert_path, NULL) != 1) {
+            LOG("upstream TLS: failed to load CA bundle %s; trying OpenSSL default paths", g_cacert_path);
+            if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+                LOG("upstream TLS: default CA paths also failed; put cacert.pem next to the program or use --insecure-upstream-tls");
+                SSL_CTX_free(ctx);
+                return -1;
+            }
+        }
+        else {
+            LOG("upstream TLS: loaded CA bundle %s", g_cacert_path);
+        }
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    }
+
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
+        SSL_CTX_free(ctx);
+        LOG("upstream TLS: SSL_new failed");
+        return -1;
+    }
+
+    SSL_set_fd(ssl, (int)s->app_fd);
+    if (server_name && *server_name) SSL_set_tlsext_host_name(ssl, server_name);
+
+    int rc = SSL_connect(ssl);
+    if (rc != 1) {
+        unsigned long err = ERR_get_error();
+        LOG("upstream TLS handshake failed host=%s err=%lu", server_name ? server_name : "", err);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    if (!g_insecure_upstream_tls) {
+        long verify = SSL_get_verify_result(ssl);
+        if (verify != X509_V_OK) {
+            LOG("upstream TLS verify failed host=%s verify=%ld", server_name ? server_name : "", verify);
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            return -1;
+        }
+    }
+
+    s->app_tls = 1;
+    s->app_ssl = ssl;
+    s->app_ssl_ctx = ctx;
+    return 0;
+}
+
 /* Terminate a session: set closing and unblock threads that may be blocked in recv(). */
 /* 终止会话: 置 closing, shutdown 以唤醒阻塞在 recv/send 的线程。
  * 幂等。绝不 closesock —— fd 的关闭留到所有线程 join 之后由收尾代码统一做。
@@ -556,7 +717,7 @@ static void session_terminate(sess_t* s) {
     LOG("%c session terminate sid=%llu", s->is_initiator ? 'A': 'B', (unsigned long long)s->sid);
 
     /* app 侧: 双向关闭唤醒 t_app2peer 的 recv 和 handle_frame 的 wfull */
-    if (s->app_fd != BADSOCK) shutdown(s->app_fd, SHUT_RDWR);
+    app_shutdown(s);
 
     /* peer 侧: 唤醒 peer_recv_loop 的 recv */
     mutex_lock(&s->peer_lk);
@@ -583,7 +744,7 @@ static void session_release(sess_t* s) {
     mutex_unlock(&s->ref_lk);
     if (n == 0) {
         /* 此刻没有任何人持有 s，安全销毁 */
-        if (s->app_fd != BADSOCK) closesock(s->app_fd);
+        app_close(s);
         if (s->peer_fd != BADSOCK) closesock(s->peer_fd);
         session_uninit(s);          /* 销毁 recv_lk/peer_lk/send_lk/send_cv/out 等 */
         mutex_destroy(&s->ref_lk);
@@ -602,7 +763,7 @@ static int wfull_app(sess_t* s, const void* b, size_t n) {
     size_t snt = 0;
     while (snt < n) {
         if (s->closing) return -1;
-        int w = send(s->app_fd, p + snt, (int)(n - snt), MSG_NOSIGNAL);
+        int w = app_send(s, p + snt, n - snt);
         if (w > 0) {
             snt += (size_t)w;
             sess_touch_activity(s);   /* send 成功 -> 刷新活动 */
@@ -610,7 +771,7 @@ static int wfull_app(sess_t* s, const void* b, size_t n) {
         }
         if (w == 0) return -1;
         if (sock_is_eintr()) continue;
-        if (sock_is_timeout()) {
+        if (app_io_should_retry(s, w)) {
             /* 本次 send 超时窗口内没成功; 但只要整体活动未超时就继续 */
             if (sess_app_timed_out(s)) {
                 LOG("app send activity timeout sid=%llu", (unsigned long long)s->sid);
@@ -886,18 +1047,22 @@ static const char* strcasestr_compat(const char* hay, const char* needle) {
     return NULL;
 }
 
-/* parse "host:port" or "[v6]:port" */
-static void parse_hp(const char* s, char* host, char* port) {
+/* parse "host:port", "[v6]:port", or bare "v6". returns 1 if port is explicit. */
+static int parse_hp_ex(const char* s, char* host, char* port) {
     if (*s == '[') {
         const char* e = strchr(s, ']');
         if (e) {
             size_t l = (size_t)(e - s - 1); memcpy(host, s + 1, l); host[l] = 0;
-            const char* c = strchr(e, ':'); snprintf(port, 32, "%s", c ? c + 1 : "80"); return;
+            const char* c = strchr(e, ':'); snprintf(port, 32, "%s", c ? c + 1 : "80"); return c ? 1 : 0;
         }
     }
     const char* c = strrchr(s, ':');
-    if (c) { size_t l = (size_t)(c - s); memcpy(host, s, l); host[l] = 0; snprintf(port, 32, "%s", c + 1); }
-    else { snprintf(host, 256, "%s", s); strcpy(port, "80"); }
+    if (c && strchr(s, ':') == c) { size_t l = (size_t)(c - s); memcpy(host, s, l); host[l] = 0; snprintf(port, 32, "%s", c + 1); return 1; }
+    snprintf(host, 256, "%s", s); strcpy(port, "80"); return 0;
+}
+
+static void parse_hp(const char* s, char* host, char* port) {
+    (void)parse_hp_ex(s, host, port);
 }
 
 /* ============================================================
@@ -909,7 +1074,7 @@ static void parse_hp(const char* s, char* host, char* port) {
  * ============================================================ */
 static int rewrite_request(const char* hdr, size_t he,
     char* ph, char* pp, char* th, char* tp,
-    char** out_rw, uint32_t* out_rl) {
+    int* out_target_tls, char** out_rw, uint32_t* out_rl) {
     char* h = (char*)malloc(he + 1); if (!h)return -1; memcpy(h, hdr, he); h[he] = 0;
     char* eol = strstr(h, "\r\n"); if (!eol) { free(h); return -1; } *eol = 0;
     char m[16], uri[4096], v[16];
@@ -927,8 +1092,17 @@ static int rewrite_request(const char* hdr, size_t he,
     if (pl == 0 || pl >= sizeof peer_s) { free(h); return -1; }
     memcpy(peer_s, rest, pl); peer_s[pl] = 0;
 
+    int target_tls = 0;
+
     /* 第 2 段: target，从 sl1+1 到下一个 '/'(或字符串结尾) */
     char* tstart = sl1 + 1;
+    if (strncmp(tstart, "http://", 7) == 0) {
+        tstart += 7;
+    }
+    else if (strncmp(tstart, "https://", 8) == 0) {
+        target_tls = 1;
+        tstart += 8;
+    }
     char* sl2 = strchr(tstart, '/');
     if (sl2) {
         size_t tl = (size_t)(sl2 - tstart);
@@ -944,7 +1118,9 @@ static int rewrite_request(const char* hdr, size_t he,
     }
 
     parse_hp(peer_s, ph, pp);
-    parse_hp(targ_s, th, tp);
+    int target_port_explicit = parse_hp_ex(targ_s, th, tp);
+    if (target_tls && !target_port_explicit) strcpy(tp, "443");
+    if (out_target_tls) *out_target_tls = target_tls;
 
     size_t cap = he + 512; char* ob = (char*)malloc(cap); if (!ob) { free(h); return -1; } size_t ol = 0;
     ol += (size_t)snprintf(ob + ol, cap - ol, "%s %s %s\r\n", m, rp, v);
@@ -1031,7 +1207,7 @@ static int is_redirect_response(const char* resp, size_t resp_len) {
 static int rewrite_location(
     const char* a_peer_host, const char* a_peer_port,
     const char* b_side_host, const char* b_side_port,
-    const char* target_host, const char* target_port,
+    const char* target_host, const char* target_port, int target_tls,
     const char* location, size_t loc_len,
     char* out_buf, size_t out_bufsize)
 {
@@ -1040,14 +1216,10 @@ static int rewrite_location(
     int is_absolute = 0;
     const char* host_path_start = NULL;
     size_t host_path_len = 0;
-    int is_https = 0;
+    int loc_https = 0;
     /* 检查是否是绝对 URL */
     if (strncasecmp(location, "http://", 7) == 0 ||
-        (is_https = strncasecmp(location, "https://", 8) == 0)) {
-        if (is_https) {
-            LOG("Location rewrite for https is not supported");
-            return -1;
-        }
+        (loc_https = strncasecmp(location, "https://", 8) == 0)) {
         const char* scheme_end = (const char*)memmem(location, loc_len, "://", 3);
         if (!scheme_end) {
             if (loc_len >= out_bufsize) return -1;
@@ -1111,8 +1283,11 @@ static int rewrite_location(
     if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
     pos += ret;
 
-    /* 绝对 URL：直接追加 host:port/path（去掉 http://） */
+    /* 绝对 URL：追加 scheme://host:port/path（去掉客户端访问 A 的 scheme） */
     if (is_absolute) {
+        ret = snprintf(out_buf + pos, out_bufsize - pos, "%s://", loc_https ? "https" : "http");
+        if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
+        pos += ret;
         if ((size_t)pos + host_path_len >= out_bufsize) return -1;
         memcpy(out_buf + pos, host_path_start, host_path_len);
         pos += (int)host_path_len;
@@ -1120,7 +1295,11 @@ static int rewrite_location(
         return pos;
     }
 
-    /* 相对路径：需要插入 target_host:target_port，然后追加路径 */
+    /* 相对路径：需要插入 target scheme/host/port，然后追加路径 */
+    ret = snprintf(out_buf + pos, out_bufsize - pos, "%s://", target_tls ? "https" : "http");
+    if (ret < 0 || (size_t)(pos + ret) >= out_bufsize) return -1;
+    pos += ret;
+
     int v6_target = strchr(target_host, ':') != NULL;
     if (v6_target) {
         ret = snprintf(out_buf + pos, out_bufsize - pos, "[%s]:%s",
@@ -1153,7 +1332,7 @@ static int rewrite_location(
      const char* resp, size_t resp_len,
      const char* a_peer_host, const char* a_peer_port,
      const char* b_side_host, const char* b_side_port,
-     const char* target_host, const char* target_port)
+     const char* target_host, const char* target_port, int target_tls)
  {
      if (!is_redirect_response(resp, resp_len)) {
          return NULL;
@@ -1169,7 +1348,7 @@ static int rewrite_location(
      int new_loc_len = rewrite_location(
          a_peer_host, a_peer_port,
          b_side_host, b_side_port,
-         target_host, target_port,
+         target_host, target_port, target_tls,
          location, loc_len,
          new_location, sizeof new_location
      );
@@ -1245,7 +1424,7 @@ static int rewrite_location(
      sess_t* s = (sess_t*)a; char* c = (char*)malloc(IO_CHUNK);
      for (;;) {
          if (s->closing) break;
-         int r = recv(s->app_fd, c, IO_CHUNK, 0);
+         int r = app_recv(s, c, IO_CHUNK);
          if (r > 0) {
              sess_touch_activity(s);             /* recv 成功 -> 刷新活动 */
              uint64_t off;
@@ -1258,7 +1437,7 @@ static int rewrite_location(
          if (r == 0) break;                      /* 对端正常关闭 */
          /* r < 0 */
          if (sock_is_eintr()) continue;
-         if (sock_is_timeout()) {
+         if (app_io_should_retry(s, r)) {
              if (sess_app_timed_out(s)) {
                  LOG("app recv activity timeout sid=%llu", (unsigned long long)s->sid);
                  break;
@@ -1331,7 +1510,7 @@ static int process_response_data_a_side(sess_t* s, const char* data, size_t data
             s->resp_header_buf, header_size,
             s->my_host, s->my_port,
             s->ph, s->pp,
-            s->target_host, s->target_port
+            s->target_host, s->target_port, s->target_tls
         );
 
         const char* to_send = rewritten ? rewritten : s->resp_header_buf;
@@ -1840,8 +2019,8 @@ static void* handle_client(void* arg) {
     char* hdr; size_t he;
     if (hin_read_headers(&in, &hdr, &he) < 0) { hin_free(&in); closesock(cfd); return 0; }
 
-    char ph[256], pp[32], th[256], tp[32]; char* rw = NULL; uint32_t rl = 0;
-    if (rewrite_request(hdr, he, ph, pp, th, tp, &rw, &rl) < 0) {
+    char ph[256], pp[32], th[256], tp[32]; int target_tls = 0; char* rw = NULL; uint32_t rl = 0;
+    if (rewrite_request(hdr, he, ph, pp, th, tp, &target_tls, &rw, &rl) < 0) {
         const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
         wfull(cfd, e, strlen(e)); hin_free(&in); closesock(cfd); return 0;
     }
@@ -1855,16 +2034,18 @@ static void* handle_client(void* arg) {
     get_socket_address(cfd, s->my_host, s->my_port);
     snprintf(s->target_host, sizeof s->target_host, "%s", th);
     snprintf(s->target_port, sizeof s->target_port, "%s", tp);
+    s->target_tls = target_tls;
 
-    char tgt[400]; int v6 = strchr(th, ':') != NULL;
-    if (v6) snprintf(tgt, sizeof tgt, "[%s]:%s\n", th, tp); else snprintf(tgt, sizeof tgt, "%s:%s\n", th, tp);
+    char tgt[416]; int v6 = strchr(th, ':') != NULL;
+    if (v6) snprintf(tgt, sizeof tgt, "%s [%s]:%s\n", target_tls ? "https" : "http", th, tp);
+    else snprintf(tgt, sizeof tgt, "%s %s:%s\n", target_tls ? "https" : "http", th, tp);
     size_t tl = strlen(tgt);
     s->open_len = (uint32_t)(tl + rl); s->open_pl = (char*)malloc(s->open_len);
     memcpy(s->open_pl, tgt, tl); memcpy(s->open_pl + tl, rw, rl);
     free(rw);
 
-    LOG("new client session sid=%llu -> peer %s:%s target %s:%s",
-        (unsigned long long)s->sid, ph, pp, th, tp);
+    LOG("new client session sid=%llu -> peer %s:%s target %s://%s:%s",
+        (unsigned long long)s->sid, ph, pp, target_tls ? "https" : "http", th, tp);
 
     s->app_io_timeout = g_client_io_timeout;   /* 启用活动超时 */
     sess_touch_activity(s);                     /* 初始化活动时间 */
@@ -1886,14 +2067,14 @@ static void* handle_client(void* arg) {
             session_request_peer_close(s);
             break;
         }
-        char ph2[256], pp2[32], th2[256], tp2[32]; char* rw2 = NULL; uint32_t rl2 = 0;
-        if (rewrite_request(h2, he2, ph2, pp2, th2, tp2, &rw2, &rl2) < 0) {
+        char ph2[256], pp2[32], th2[256], tp2[32]; int target_tls2 = 0; char* rw2 = NULL; uint32_t rl2 = 0;
+        if (rewrite_request(h2, he2, ph2, pp2, th2, tp2, &target_tls2, &rw2, &rl2) < 0) {
             const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
             wfull(cfd, e, strlen(e));
             in.off += he2;
             continue;
         }
-        if (strcmp(ph2, ph) || strcmp(pp2, pp) || strcmp(th2, th) || strcmp(tp2, tp)) {
+        if (strcmp(ph2, ph) || strcmp(pp2, pp) || strcmp(th2, th) || strcmp(tp2, tp) || target_tls2 != target_tls) {
             free(rw2);
             const char* e = "HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\n\r\n";
             wfull(cfd, e, strlen(e)); break;
@@ -1934,30 +2115,39 @@ static void* handle_peer(void* arg) {
         size_t addrlen = (size_t)(nl - pl); char addr[400];
         if (addrlen >= sizeof addr)addrlen = sizeof addr - 1;
         memcpy(addr, pl, addrlen); addr[addrlen] = 0;
-        char th[256], tp[32]; parse_hp(addr, th, tp);
+        int target_tls = 0;
+        const char* addrp = addr;
+        if (strncmp(addrp, "https ", 6) == 0) { target_tls = 1; addrp += 6; }
+        else if (strncmp(addrp, "http ", 5) == 0) { addrp += 5; }
+        char th[256], tp[32]; parse_hp(addrp, th, tp);
 
-        
         sock_t tfd = connect_with_timeout(th, tp, g_client_connect_timeout);
         if (tfd == BADSOCK) {
-            LOG("connect to target %s:%s failed", th, tp); free(pl);
+            LOG("connect to target %s://%s:%s failed", target_tls ? "https" : "http", th, tp); free(pl);
             send_close_and_wait_peer(pfd, h.value); closesock(pfd); return 0;
         }
         nodelay_on(tfd);
 
-        char* req = nl + 1; size_t reqlen = h.plen - addrlen - 1;
-        if (wfull(tfd, req, reqlen) < 0) { free(pl); closesock(tfd); closesock(pfd); return 0; }
-        free(pl);
-
         sess_t* s = (sess_t*)calloc(1, sizeof * s);
         session_init(s);
+        s->app_fd = tfd; s->peer_fd = BADSOCK; s->is_initiator = 0; s->sid = h.value; s->target_tls = target_tls;
         /* 目标连接(app 侧)用活动超时, 短轮询间隔 */
         s->app_io_timeout = g_client_io_timeout;
         set_recv_timeout(tfd, APP_POLL_INTERVAL_SEC);
         set_send_timeout(tfd, APP_POLL_INTERVAL_SEC);
         sess_touch_activity(s);
 
-        s->app_fd = tfd; s->peer_fd = BADSOCK; s->is_initiator = 0; s->sid = h.value;
-        LOG("passive session sid=%llu target %s:%s", (unsigned long long)s->sid, th, tp);
+        if (target_tls && app_start_tls(s, th) < 0) {
+            free(pl);
+            session_release(s);
+            send_close_and_wait_peer(pfd, h.value); closesock(pfd); return 0;
+        }
+
+        char* req = nl + 1; size_t reqlen = h.plen - addrlen - 1;
+        if (wfull_app(s, req, reqlen) < 0) { free(pl); session_release(s); closesock(pfd); return 0; }
+        free(pl);
+
+        LOG("passive session sid=%llu target %s://%s:%s", (unsigned long long)s->sid, target_tls ? "https" : "http", th, tp);
         b_register(s);
         mutex_lock(&s->peer_lk);
         peer_install_locked(s, pfd);
@@ -2061,6 +2251,9 @@ static void print_help(const char* prog) {
         "  -pio SECONDS         Peer I/O and heartbeat timeout (default: 20s)\n"
         "  -hi SECONDS          Peer heartbeat interval, minimum 1s (default: 5s)\n"
         "  -k PASSWORD          Encrypt A<->B peer payloads with AES-CTR\n"
+        "  --insecure-upstream-tls\n"
+        "                        Disable certificate verification for B->HTTPS target\n"
+        "                        Otherwise place cacert.pem next to the program\n"
         "\n"
         "  -h, --help           Show this help message\n"
         "\n"
@@ -2135,6 +2328,7 @@ int main(int argc, char** argv) {
 #endif
     mutex_init(&g_tbl_lk);
     mutex_init(&g_gen_sid_lk);
+    init_cacert_path(argv[0]);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i + 1 < argc)
@@ -2159,6 +2353,8 @@ int main(int argc, char** argv) {
             g_heartbeat_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-k") && i + 1 < argc)
             crypto_set_password(argv[++i]);
+        else if (!strcmp(argv[i], "--insecure-upstream-tls"))
+            g_insecure_upstream_tls = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_help(argv[0]);
             return 0;
@@ -2167,7 +2363,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "Usage: %s [-p port] [-b max_buffer_bytes] [-t reconnect_timeout_sec] [-i reconnect_ms]\n"
                 "          [-cc client_connect_timeout] [-cio client_io_timeout]\n"
                 "          [-pc peer_connect_timeout] [-pio peer_io_timeout]\n"
-                "          [-hi heartbeat_interval] [-k password]\n", argv[0]);
+                "          [-hi heartbeat_interval] [-k password] [--insecure-upstream-tls]\n", argv[0]);
             return 1;
         }
     }
@@ -2185,6 +2381,8 @@ int main(int argc, char** argv) {
     LOG("peer timeout: connect=%ds, io=%ds", g_peer_connect_timeout, g_peer_io_timeout);
     LOG("peer heartbeat: interval=%ds, timeout follows peer io timeout", g_heartbeat_interval);
     LOG("peer encryption: %s", g_crypto_enabled ? "AES-CTR enabled" : "disabled");
+    LOG("upstream TLS verification: %s", g_insecure_upstream_tls ? "disabled (insecure)" : "enabled");
+    if (!g_insecure_upstream_tls) LOG("upstream TLS CA bundle: put cacert.pem next to the program (%s)", g_cacert_path);
 
     for (;;) {
         sock_t fd = accept(lfd, NULL, NULL);

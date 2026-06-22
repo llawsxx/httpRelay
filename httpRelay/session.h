@@ -5,6 +5,9 @@
 
 typedef struct sess_t {
     sock_t app_fd;            /* application side: A=client, B=target */
+    int app_tls;              /* B-side target uses TLS */
+    void* app_ssl;
+    void* app_ssl_ctx;
     sock_t peer_fd;           /* A<->B TCP, BADSOCK when down */
     mutex_t peer_lk;
     sw_t out;                 /* our -> peer send window */
@@ -40,6 +43,7 @@ typedef struct sess_t {
     char my_port[32];
     char target_host[256];
     char target_port[32];
+    int target_tls;
 
     char* resp_header_buf;
     size_t resp_header_cap;
