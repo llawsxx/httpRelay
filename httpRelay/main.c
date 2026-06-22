@@ -65,6 +65,7 @@ static int    g_crypto_enabled = 0;             /* A<->B payload AES-CTR encrypt
 static int    g_insecure_upstream_tls = 0;      /* skip B-side HTTPS target certificate verification */
 static uint8_t g_crypto_key[16];
 static char   g_cacert_path[1024] = "cacert.pem";
+static SSL_CTX* g_upstream_tls_ctx = NULL;
 #define IO_CHUNK 32768
 #define APP_POLL_INTERVAL_SEC 2
 #define CRYPTO_BLOCK_SIZE 16
@@ -542,7 +543,6 @@ static void session_init(sess_t* s) {
     s->target_tls = 0;
     s->app_tls = 0;
     s->app_ssl = NULL;
-    s->app_ssl_ctx = NULL;
     s->my_host[0] = 0;
     s->my_port[0] = 0;
     s->resp_header_buf = NULL;
@@ -635,42 +635,53 @@ static void app_close(sess_t* s) {
         SSL_free((SSL*)s->app_ssl);
         s->app_ssl = NULL;
     }
-    if (s->app_ssl_ctx) {
-        SSL_CTX_free((SSL_CTX*)s->app_ssl_ctx);
-        s->app_ssl_ctx = NULL;
-    }
     if (s->app_fd != BADSOCK) closesock(s->app_fd);
     s->app_fd = BADSOCK;
 }
 
-static int app_start_tls(sess_t* s, const char* server_name) {
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) {
+static int upstream_tls_init(void) {
+    if (g_upstream_tls_ctx) return 0;
+
+    g_upstream_tls_ctx = SSL_CTX_new(TLS_client_method());
+    if (!g_upstream_tls_ctx) {
         LOG("upstream TLS: SSL_CTX_new failed");
         return -1;
     }
 
     if (g_insecure_upstream_tls) {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_verify(g_upstream_tls_ctx, SSL_VERIFY_NONE, NULL);
     }
     else {
-        if (SSL_CTX_load_verify_locations(ctx, g_cacert_path, NULL) != 1) {
+        if (SSL_CTX_load_verify_locations(g_upstream_tls_ctx, g_cacert_path, NULL) != 1) {
             LOG("upstream TLS: failed to load CA bundle %s; trying OpenSSL default paths", g_cacert_path);
-            if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+            if (SSL_CTX_set_default_verify_paths(g_upstream_tls_ctx) != 1) {
                 LOG("upstream TLS: default CA paths also failed; put cacert.pem next to the program or use --insecure-upstream-tls");
-                SSL_CTX_free(ctx);
+                SSL_CTX_free(g_upstream_tls_ctx);
+                g_upstream_tls_ctx = NULL;
                 return -1;
             }
         }
         else {
             LOG("upstream TLS: loaded CA bundle %s", g_cacert_path);
         }
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        SSL_CTX_set_verify(g_upstream_tls_ctx, SSL_VERIFY_PEER, NULL);
     }
 
-    SSL* ssl = SSL_new(ctx);
+    return 0;
+}
+
+static void upstream_tls_uninit(void) {
+    if (g_upstream_tls_ctx) {
+        SSL_CTX_free(g_upstream_tls_ctx);
+        g_upstream_tls_ctx = NULL;
+    }
+}
+
+static int app_start_tls(sess_t* s, const char* server_name) {
+    if (upstream_tls_init() < 0) return -1;
+
+    SSL* ssl = SSL_new(g_upstream_tls_ctx);
     if (!ssl) {
-        SSL_CTX_free(ctx);
         LOG("upstream TLS: SSL_new failed");
         return -1;
     }
@@ -683,7 +694,6 @@ static int app_start_tls(sess_t* s, const char* server_name) {
         unsigned long err = ERR_get_error();
         LOG("upstream TLS handshake failed host=%s err=%lu", server_name ? server_name : "", err);
         SSL_free(ssl);
-        SSL_CTX_free(ctx);
         return -1;
     }
 
@@ -692,14 +702,12 @@ static int app_start_tls(sess_t* s, const char* server_name) {
         if (verify != X509_V_OK) {
             LOG("upstream TLS verify failed host=%s verify=%ld", server_name ? server_name : "", verify);
             SSL_free(ssl);
-            SSL_CTX_free(ctx);
             return -1;
         }
     }
 
     s->app_tls = 1;
     s->app_ssl = ssl;
-    s->app_ssl_ctx = ctx;
     return 0;
 }
 
@@ -2370,9 +2378,14 @@ int main(int argc, char** argv) {
 
     normalize_timeouts();
 
+    if (upstream_tls_init() < 0) {
+        return 1;
+    }
+
     sock_t lfd = listen_on(g_port);
     if (lfd == BADSOCK) {
         fprintf(stderr, "failed to listen on port %d (err=%d)\n", g_port, sockerrno);
+        upstream_tls_uninit();
         return 1;
     }
     LOG("httprelay listening on :%d  max_buffer=%zu reconnect_timeout=%ds",
@@ -2400,6 +2413,7 @@ int main(int argc, char** argv) {
 
     mutex_destroy(&g_tbl_lk);
     mutex_destroy(&g_gen_sid_lk);
+    upstream_tls_uninit();
 #ifdef _WIN32
     WSACleanup();
 #endif
