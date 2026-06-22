@@ -1,5 +1,6 @@
 #ifndef HTTPRELAY_PLATFORM_H
 #define HTTPRELAY_PLATFORM_H
+#define _GNU_SOURCE 
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,6 @@ static void* memmem_compat(const void* h, size_t hl, const void* n, size_t nl) {
 #endif
 
 #else
-#define _GNU_SOURCE
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
